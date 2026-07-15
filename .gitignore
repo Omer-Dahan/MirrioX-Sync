@@ -1,0 +1,39 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Documentation (as per user rules)
+*.md
+!README.md
+
+# PID file
+mirriox.pid
+
+# Application Data & Database
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+sessions/
+
+# Claude Code project settings
+.claude/

@@ -1,0 +1,5 @@
+telethon==1.37.0
+python-telegram-bot==21.9
+python-dotenv==1.0.1
+httpx==0.28.1
+cryptg==0.6.0

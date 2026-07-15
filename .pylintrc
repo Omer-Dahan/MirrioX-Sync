@@ -1,0 +1,37 @@
+[FORMAT]
+# Max line length — 140 covers all existing Hebrew UI strings and inline type comments.
+max-line-length=140
+
+[DESIGN]
+# Dataclass models (Job, Source, Destination) legitimately require many fields.
+max-attributes=30
+# Complex text-builder functions in texts.py use many local variables.
+max-locals=25
+# Central dispatch / poll loop functions have many branches by design.
+max-branches=22
+# _poll_loop coordinates job lifecycle, retries, and reconnection — many statements.
+max-statements=90
+# Telethon _send_group_by_ref has many early-return guards for different media types.
+max-returns=12
+# Single-responsibility classes (CopyEngine, _CollapseNetworkErrors) have one public method.
+min-public-methods=1
+# RateLimiter.__init__ takes 9 parameters; job_service.create_draft_job takes 11.
+max-args=12
+max-positional-arguments=12
+
+[BASIC]
+# Allow private module-level state variables (e.g. _connection, _db_path in db.py)
+# without forcing UPPER_CASE. These are mutable singletons, not true constants.
+const-rgx=[A-Za-z_][A-Za-z0-9_]*
+# Config dataclass fields use UPPER_CASE to mirror environment-variable names (BOT_TOKEN etc.).
+class-attribute-naming-style=any
+# Allow UPPER_CASE for frozen dataclass field annotations treated as instance attrs.
+attr-naming-style=any
+
+[MESSAGES CONTROL]
+disable=
+    C0115,  # missing-class-docstring   — internal tool, docstrings not required
+    C0116,  # missing-function-docstring — internal tool, docstrings not required
+    C0415,  # import-outside-toplevel   — lazy imports used intentionally (circular-dep avoidance, TYPE_CHECKING)
+    W0603,  # global-statement          — module-level singletons in db.py and worker_main.py
+    W0718,  # broad-exception-caught    — intentional resilience in async network handlers

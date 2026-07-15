@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from telegram import InlineKeyboardMarkup
 
 from app.ui import texts, keyboards
-from app.repositories import source_repo, filter_repo, state_repo
+from app.repositories import source_repo, filter_repo, state_repo, channel_access_repo
 
 if TYPE_CHECKING:
     from app.models import Job, Source, Destination, Admin, BlockedWord, WorkerState
@@ -65,7 +65,8 @@ def render_source_detail(source_id: int) -> tuple[str, InlineKeyboardMarkup]:
     src = source_repo.get_source_by_id(source_id)
     if src is None:
         return texts.error_text("מקור לא נמצא"), keyboards.kb_error_back("sources")
-    return texts.source_detail_text(src), keyboards.kb_source_detail(source_id)
+    access = channel_access_repo.get_report(channel_access_repo.KIND_SOURCE, source_id)
+    return texts.source_detail_text(src, access), keyboards.kb_source_detail(source_id)
 
 
 def render_dest_list(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
@@ -77,7 +78,8 @@ def render_dest_detail(dest_id: int) -> tuple[str, InlineKeyboardMarkup]:
     dest = source_repo.get_destination_by_id(dest_id)
     if dest is None:
         return texts.error_text("יעד לא נמצא"), keyboards.kb_error_back("destinations")
-    return texts.dest_detail_text(dest), keyboards.kb_dest_detail(dest_id)
+    access = channel_access_repo.get_report(channel_access_repo.KIND_DEST, dest_id)
+    return texts.dest_detail_text(dest, access), keyboards.kb_dest_detail(dest_id)
 
 
 def render_blocked_words(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:

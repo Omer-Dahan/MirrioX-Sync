@@ -95,12 +95,13 @@ def _get_scan_engine(client: TelegramClient) -> ScanEngine:
     return engine
 
 
-async def run_primary_duties(
-    client: TelegramClient, resolve_trigger: asyncio.Event | None
-) -> bool:
+async def run_primary_duties(client: TelegramClient) -> bool:
     """
     Work that must happen on exactly one account: duplicate scans, bulk
-    deletes, heartbeat and channel resolution.
+    deletes and the heartbeat.
+
+    Channel access checks are deliberately not here — they are per-account and
+    every runner performs its own (see check_channels_for_account).
 
     Returns True if a scan or delete ran (so the caller should loop again
     immediately instead of sleeping).
@@ -141,9 +142,6 @@ async def run_primary_duties(
         return True
 
     state_repo.heartbeat()
-    if resolve_trigger is not None:
-        resolve_trigger.clear()
-    await resolve_pending_channels(client)
     return False
 
 
@@ -507,47 +505,102 @@ async def send_daily_limit_notification(
     await _notify(state_repo.get_setting("main_chat_id"), text, job_id, "daily_limit")
 
 
-async def resolve_pending_channels(client: TelegramClient) -> None:
+async def check_channels_for_account(client: TelegramClient, userbot_id: int) -> None:
     """
-    When idle, resolve title and ID for any sources/destinations
-    that haven't been verified yet. Updates the DB so the bot UI
-    shows real channel names and marks access errors clearly.
+    Probe every source/destination this account hasn't checked yet and record
+    whether it can reach them, so the UI can report access per account.
+
+    Access is a per-account fact: one userbot may be a member of a channel while
+    another is not. Every active account therefore runs this for itself, and the
+    first one that gets through also fills in the channel's title, ID and extra
+    info — a channel is resolvable as long as *some* account can see it.
     """
-    from app.repositories import source_repo
+    from app.repositories import channel_access_repo, source_repo
 
-    unresolved_sources = source_repo.get_unresolved_sources()
-    unresolved_dests = source_repo.get_unresolved_destinations()
-
-    if not unresolved_sources and not unresolved_dests:
+    pending = channel_access_repo.get_unchecked_channels(userbot_id)
+    if not pending:
         return
 
-    for src in unresolved_sources:
-        try:
-            entity = await get_entity_safe(client, src.channel_ref)
-            title = getattr(entity, "title", src.channel_ref)
-            source_repo.update_source_resolved(src.id, title, entity.id)
-            source_repo.update_source_name(src.id, title)
-            source_repo.set_source_validation_error(src.id, None)
-            extra = await _fetch_channel_extra_info(client, entity)
-            source_repo.update_source_extra_info(src.id, **extra)
-            logger.info("Resolved source '%s': %s (id=%d)", src.name, title, entity.id)
-        except Exception as e:
-            source_repo.set_source_validation_error(src.id, str(e))
-            logger.warning("Cannot access source '%s' (%s): %s", src.name, src.channel_ref, e)
+    for kind, channel_id, channel_ref in pending:
+        is_source = kind == channel_access_repo.KIND_SOURCE
+        channel = (
+            source_repo.get_source_by_id(channel_id)
+            if is_source
+            else source_repo.get_destination_by_id(channel_id)
+        )
+        if channel is None:
+            continue  # deleted while we were working through the list
 
-    for dst in unresolved_dests:
         try:
-            entity = await get_entity_safe(client, dst.channel_ref)
-            title = getattr(entity, "title", dst.channel_ref)
-            source_repo.update_destination_resolved(dst.id, title, entity.id)
-            source_repo.update_destination_name(dst.id, title)
-            source_repo.set_dest_validation_error(dst.id, None)
-            extra = await _fetch_channel_extra_info(client, entity)
-            source_repo.update_destination_extra_info(dst.id, **extra)
-            logger.info("Resolved destination '%s': %s (id=%d)", dst.name, title, entity.id)
+            entity = await get_entity_safe(client, channel_ref)
+            # get_entity alone resolves public channels without membership; read one
+            # message so the probe reflects what a job would actually be able to do.
+            await client.get_messages(entity, limit=1)
         except Exception as e:
-            source_repo.set_dest_validation_error(dst.id, str(e))
-            logger.warning("Cannot access destination '%s' (%s): %s", dst.name, dst.channel_ref, e)
+            channel_access_repo.record(kind, channel_id, userbot_id, False, str(e)[:300])
+            logger.info(
+                "Userbot #%d has no access to %s '%s' (%s): %s",
+                userbot_id, kind, channel.name, channel_ref, e,
+            )
+            _mark_unreachable_if_nobody_has_access(kind, channel_id, str(e))
+            continue
+
+        channel_access_repo.record(kind, channel_id, userbot_id, True, None)
+        logger.info(
+            "Userbot #%d has access to %s '%s'", userbot_id, kind, channel.name
+        )
+
+        if channel.resolved_id is None:
+            await _resolve_channel_info(client, kind, channel_id, entity, channel_ref)
+
+
+async def _resolve_channel_info(
+    client: TelegramClient, kind: str, channel_id: int, entity, channel_ref: str
+) -> None:
+    """Fill in title, ID and extra info for a channel this account can reach."""
+    from app.repositories import channel_access_repo, source_repo
+
+    is_source = kind == channel_access_repo.KIND_SOURCE
+    title = getattr(entity, "title", channel_ref)
+
+    if is_source:
+        source_repo.update_source_resolved(channel_id, title, entity.id)
+        source_repo.update_source_name(channel_id, title)
+        source_repo.set_source_validation_error(channel_id, None)
+    else:
+        source_repo.update_destination_resolved(channel_id, title, entity.id)
+        source_repo.update_destination_name(channel_id, title)
+        source_repo.set_dest_validation_error(channel_id, None)
+    logger.info("Resolved %s '%s': %s (id=%d)", kind, channel_ref, title, entity.id)
+
+    # Metadata is a bonus — the channel is already resolved and reachable without it.
+    try:
+        extra = await _fetch_channel_extra_info(client, entity)
+    except Exception as e:
+        logger.warning("Could not fetch extra info for %s '%s': %s", kind, channel_ref, e)
+        return
+    if is_source:
+        source_repo.update_source_extra_info(channel_id, **extra)
+    else:
+        source_repo.update_destination_extra_info(channel_id, **extra)
+
+
+def _mark_unreachable_if_nobody_has_access(kind: str, channel_id: int, error: str) -> None:
+    """
+    Flag the channel as inaccessible only once every active account has tried and
+    failed — a single account's failure says nothing while others may still get in.
+    """
+    from app.repositories import channel_access_repo, source_repo
+
+    if channel_access_repo.any_active_has_access(kind, channel_id):
+        return
+    if channel_access_repo.pending_active_checks(kind, channel_id) > 0:
+        return
+
+    if kind == channel_access_repo.KIND_SOURCE:
+        source_repo.set_source_validation_error(channel_id, error)
+    else:
+        source_repo.set_dest_validation_error(channel_id, error)
 
 
 async def _fetch_channel_extra_info(client: TelegramClient, entity) -> dict:

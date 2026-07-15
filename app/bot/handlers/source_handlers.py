@@ -6,7 +6,7 @@ import logging
 from telethon import TelegramClient
 
 from app.models import ValidationError
-from app.repositories import source_repo
+from app.repositories import source_repo, channel_access_repo
 from app.services import validation_service
 from app.ui import renderer, texts, keyboards
 from app.ui.keyboards import to_telethon
@@ -34,6 +34,22 @@ async def dispatch_sources(bot: TelegramClient, event, uid: int) -> None:
             await _dispatch_src_action(bot, uid, src_id, action)
 
 
+_ACCESS_CHECK_TIMEOUT_S = 20
+
+
+async def _await_access_checks(kind: str, channel_id: int) -> None:
+    """
+    Wait until every active account has probed the channel.
+
+    Best-effort: an account busy with a long job may take longer, and the detail
+    screen shows those as "pending" rather than blocking the user any further.
+    """
+    for _ in range(_ACCESS_CHECK_TIMEOUT_S):
+        await asyncio.sleep(1)
+        if channel_access_repo.pending_active_checks(kind, channel_id) == 0:
+            return
+
+
 async def _dispatch_src_action(bot: TelegramClient, uid: int, src_id: int, action: str) -> None:
     if action == "view":
         text, kb = renderer.render_source_detail(src_id)
@@ -43,13 +59,12 @@ async def _dispatch_src_action(bot: TelegramClient, uid: int, src_id: int, actio
         if src:
             source_repo.reset_source_for_refresh(src_id)
             _worker.signal_resolve_now()
-            loading_text = f"{texts.TITLE_SOURCE_DETAIL}: <b>{texts.esc(src.name)}</b>\n\n⏳ מאחזר מידע…"
+            loading_text = (
+                f"{texts.TITLE_SOURCE_DETAIL}: <b>{texts.esc(src.name)}</b>\n\n"
+                f"⏳ בודק גישה מול כל חשבונות היוזרבוט…"
+            )
             await update_main_message(bot, loading_text, to_telethon(renderer.render_source_detail(src_id)[1]))
-            for _ in range(12):
-                await asyncio.sleep(1)
-                updated = source_repo.get_source_by_id(src_id)
-                if updated and updated.channel_type is not None:
-                    break
+            await _await_access_checks(channel_access_repo.KIND_SOURCE, src_id)
             text, kb = renderer.render_source_detail(src_id)
         else:
             text, kb = renderer.render_error("מקור לא נמצא", "sources")
@@ -108,13 +123,12 @@ async def _dispatch_dst_action(bot: TelegramClient, uid: int, dst_id: int, actio
         if dst:
             source_repo.reset_destination_for_refresh(dst_id)
             _worker.signal_resolve_now()
-            loading_text = f"{texts.TITLE_DEST_DETAIL}: <b>{texts.esc(dst.name)}</b>\n\n⏳ מאחזר מידע…"
+            loading_text = (
+                f"{texts.TITLE_DEST_DETAIL}: <b>{texts.esc(dst.name)}</b>\n\n"
+                f"⏳ בודק גישה מול כל חשבונות היוזרבוט…"
+            )
             await update_main_message(bot, loading_text, to_telethon(renderer.render_dest_detail(dst_id)[1]))
-            for _ in range(12):
-                await asyncio.sleep(1)
-                updated = source_repo.get_destination_by_id(dst_id)
-                if updated and updated.channel_type is not None:
-                    break
+            await _await_access_checks(channel_access_repo.KIND_DEST, dst_id)
             text, kb = renderer.render_dest_detail(dst_id)
         else:
             text, kb = renderer.render_error("יעד לא נמצא", "destinations")

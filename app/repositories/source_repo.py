@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Optional
 from app import db
 from app.models import Source, Destination
+from app.repositories import channel_access_repo
 
 
 # ── Sources ────────────────────────────────────────────────────────────────────
@@ -43,17 +44,19 @@ def add_source(name: str, channel_ref: str) -> Source:
 
 
 def reset_source_for_refresh(source_id: int) -> None:
-    """Clear resolved_id so the worker re-fetches full channel info."""
+    """Clear resolved_id and every account's access result so both are re-checked."""
     conn = db.get_connection()
     conn.execute("UPDATE sources SET resolved_id = NULL WHERE id = ?", (source_id,))
     conn.commit()
+    channel_access_repo.clear_for_channel(channel_access_repo.KIND_SOURCE, source_id)
 
 
 def reset_destination_for_refresh(dest_id: int) -> None:
-    """Clear resolved_id so the worker re-fetches full channel info."""
+    """Clear resolved_id and every account's access result so both are re-checked."""
     conn = db.get_connection()
     conn.execute("UPDATE destinations SET resolved_id = NULL WHERE id = ?", (dest_id,))
     conn.commit()
+    channel_access_repo.clear_for_channel(channel_access_repo.KIND_DEST, dest_id)
 
 
 def update_source_name(source_id: int, name: str) -> None:
@@ -127,6 +130,7 @@ def delete_source(source_id: int) -> bool:
     conn = db.get_connection()
     cur = conn.execute("DELETE FROM sources WHERE id = ?", (source_id,))
     conn.commit()
+    channel_access_repo.clear_for_channel(channel_access_repo.KIND_SOURCE, source_id)
     return cur.rowcount > 0
 
 
@@ -239,4 +243,5 @@ def delete_destination(dest_id: int) -> bool:
         "DELETE FROM destinations WHERE id = ?", (dest_id,)
     )
     conn.commit()
+    channel_access_repo.clear_for_channel(channel_access_repo.KIND_DEST, dest_id)
     return cur.rowcount > 0

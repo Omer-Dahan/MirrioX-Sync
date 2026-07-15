@@ -146,11 +146,15 @@ def touch(userbot_id: int) -> None:
 
 
 def delete(userbot_id: int) -> bool:
+    from app.repositories import channel_access_repo
+
     conn = db.get_connection()
     cur = conn.execute(
         "DELETE FROM userbots WHERE id = ? AND is_default = 0", (userbot_id,)
     )
     conn.commit()
+    if cur.rowcount > 0:
+        channel_access_repo.clear_for_userbot(userbot_id)
     return cur.rowcount > 0
 
 

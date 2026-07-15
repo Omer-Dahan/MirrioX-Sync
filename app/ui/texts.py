@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING
 from app.models import ALL_CONTENT_TYPES, DEFAULT_CONTENT_TYPES
 
 if TYPE_CHECKING:
-    from app.models import Job, Source, Destination, Admin, BlockedWord, WorkerState, Userbot
+    from app.models import (
+        Job, Source, Destination, Admin, BlockedWord, WorkerState, Userbot, ChannelAccessRow,
+    )
 
 # ── Status labels ──────────────────────────────────────────────────────────────
 
@@ -595,16 +597,16 @@ def source_list_text(sources: list["Source"]) -> str:
     return f"{TITLE_SOURCES}\n\nבחר מקור מהרשימה:"
 
 
-def source_detail_text(source: "Source") -> str:
+def source_detail_text(source: "Source", access: list["ChannelAccessRow"] | None = None) -> str:
     title = source.title or "—"
     rid = str(source.resolved_id) if source.resolved_id else "⏳ ממתין לאימות"
-    status = "✅ נגיש" if source.resolved_id else ("❌ " + esc(source.validation_error) if source.validation_error else "⏳ טרם אומת")
     return (
         f"{TITLE_SOURCE_DETAIL}: <b>{esc(source.name)}</b>\n\n"
         f"הפניה: <code>{esc(source.channel_ref)}</code>\n"
         f"כותרת: {esc(title)}\n"
         f"מזהה: {rid}\n"
-        f"גישה: {status}\n"
+        f"גישה: {_access_summary(source, access or [])}\n"
+        + _channel_access_lines(access or [])
         + _channel_extra_lines(source) +
         f"נוסף: {_fmt_dt(source.created_at)}"
     )
@@ -706,19 +708,48 @@ def dest_list_text(dests: list["Destination"]) -> str:
     return f"{TITLE_DESTINATIONS}\n\nבחר יעד מהרשימה:"
 
 
-def dest_detail_text(dest: "Destination") -> str:
+def dest_detail_text(dest: "Destination", access: list["ChannelAccessRow"] | None = None) -> str:
     title = dest.title or "—"
     rid = str(dest.resolved_id) if dest.resolved_id else "⏳ ממתין לאימות"
-    status = "✅ נגיש" if dest.resolved_id else ("❌ " + esc(dest.validation_error) if dest.validation_error else "⏳ טרם אומת")
     return (
         f"{TITLE_DEST_DETAIL}: <b>{esc(dest.name)}</b>\n\n"
         f"הפניה: <code>{esc(dest.channel_ref)}</code>\n"
         f"כותרת: {esc(title)}\n"
         f"מזהה: {rid}\n"
-        f"גישה: {status}\n"
+        f"גישה: {_access_summary(dest, access or [])}\n"
+        + _channel_access_lines(access or [])
         + _channel_extra_lines(dest) +
         f"נוסף: {_fmt_dt(dest.created_at)}"
     )
+
+
+def _access_summary(ch, access: list["ChannelAccessRow"]) -> str:
+    """One-line verdict for the channel, across every active userbot account."""
+    if not access:
+        return "⏳ אין חשבונות יוזרבוט פעילים"
+    granted = sum(1 for r in access if r.has_access)
+    pending = sum(1 for r in access if r.has_access is None)
+    if granted:
+        return f"✅ נגיש ל-{granted} מתוך {len(access)} חשבונות"
+    if pending:
+        return "⏳ ממתין לבדיקה"
+    return "❌ " + esc(ch.validation_error or "אף חשבון אינו יכול לגשת לערוץ")
+
+
+def _channel_access_lines(access: list["ChannelAccessRow"]) -> str:
+    """Per-account access report. Returns a string ending with \n, or '' when empty."""
+    if not access:
+        return ""
+    lines = ["\n🤖 <b>גישה לפי חשבון:</b>"]
+    for row in access:
+        if row.has_access is None:
+            lines.append(f"⏳ {esc(row.userbot_label)} — ממתין לבדיקה")
+        elif row.has_access:
+            lines.append(f"✅ {esc(row.userbot_label)}")
+        else:
+            reason = esc((row.error or "אין גישה")[:80])
+            lines.append(f"❌ {esc(row.userbot_label)} — {reason}")
+    return "\n".join(lines) + "\n"
 
 
 def _channel_extra_lines(ch) -> str:

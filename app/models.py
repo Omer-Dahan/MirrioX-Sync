@@ -302,6 +302,31 @@ class Userbot:
 
 
 @dataclass
+class ChannelAccessRow:
+    """One account's access result for one channel, ready for display."""
+    userbot_id: int
+    userbot_label: str
+    userbot_status: str
+    has_access: Optional[bool]  # None = this account hasn't checked the channel yet
+    error: Optional[str]
+    checked_at: Optional[str]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "ChannelAccessRow":
+        label = row["name"] or row["username"] or row["phone"] or f"#{row['userbot_id']}"
+        if row["username"] and row["username"] != label:
+            label = f"{label} (@{row['username']})"
+        return cls(
+            userbot_id=row["userbot_id"],
+            userbot_label=label,
+            userbot_status=row["userbot_status"],
+            has_access=None if row["has_access"] is None else bool(row["has_access"]),
+            error=row["error"],
+            checked_at=row["checked_at"],
+        )
+
+
+@dataclass
 class WorkerState:
     id: int
     status: str  # idle | running | stopped | error

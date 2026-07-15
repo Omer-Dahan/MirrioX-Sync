@@ -166,6 +166,20 @@ CREATE TABLE IF NOT EXISTS userbots (
     error_message TEXT
 );
 
+-- Per-account access to each source/destination channel.
+-- Every active userbot probes every channel, so the UI can report exactly which
+-- accounts can reach it. A missing row means "this account hasn't checked yet".
+CREATE TABLE IF NOT EXISTS channel_access (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_kind TEXT NOT NULL CHECK(channel_kind IN ('source','destination')),
+    channel_id   INTEGER NOT NULL,
+    userbot_id   INTEGER NOT NULL,
+    has_access   INTEGER NOT NULL DEFAULT 0,
+    error        TEXT,
+    checked_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(channel_kind, channel_id, userbot_id)
+);
+
 -- Global registry of every transferred item, keyed by content.
 -- Scope is per-destination: the same content may be sent to different channels.
 CREATE TABLE IF NOT EXISTS transferred_registry (
@@ -186,6 +200,7 @@ CREATE INDEX IF NOT EXISTS idx_copied_src_id      ON copied_messages(job_id, sou
 CREATE INDEX IF NOT EXISTS idx_scan_items_media   ON duplicate_scan_items(scan_id, media_id);
 CREATE INDEX IF NOT EXISTS idx_transferred_key    ON transferred_registry(destination_id, dedup_key);
 CREATE INDEX IF NOT EXISTS idx_userbots_status    ON userbots(status);
+CREATE INDEX IF NOT EXISTS idx_channel_access_ch  ON channel_access(channel_kind, channel_id);
 -- NOTE: the index on copied_messages(userbot_id, ...) is created in _run_migrations,
 -- not here. This script runs before migrations, so on an existing database the
 -- column does not exist yet and CREATE INDEX would fail.

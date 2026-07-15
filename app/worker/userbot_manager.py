@@ -13,7 +13,10 @@ Job hand-off rules:
     different account picks it up. Only when *every* active account has been
     excluded does the job fail.
   - The primary runner (the default account) additionally owns the singleton
-    duties: duplicate scans, bulk deletes and channel resolution.
+    duties: duplicate scans and bulk deletes.
+  - Channel access is checked by every runner for its own account, because access
+    is a per-account fact: one account may be a member of a channel while another
+    is not. The results feed the per-account access report in the bot UI.
 """
 from __future__ import annotations
 
@@ -38,6 +41,9 @@ logger = logging.getLogger(__name__)
 _LISTENER_RECONCILE_EVERY_S = 30
 # Safety bound so a bad DB state can never spin the claim loop.
 _MAX_CONTINUOUS_CLAIMS_PER_CYCLE = 10
+# Floor between channel access checks while a runner is busy copying, so the
+# per-message callback can't turn into a query per message.
+_CHANNEL_CHECK_EVERY_S = 10
 
 
 def build_client(config: Config, session_name: str) -> TelegramClient:
@@ -76,6 +82,7 @@ class UserbotRunner:
         self._listeners: dict[int, object] = {}   # job_id → Telethon handler
         self._live_lock = asyncio.Lock()          # serialises live sends on this account
         self._last_reconcile = 0.0
+        self._last_channel_check = 0.0
 
     @property
     def id(self) -> int:
@@ -138,9 +145,25 @@ class UserbotRunner:
                 pass
 
     async def _resolve_if_needed(self) -> None:
-        """Passed to CopyEngine — only the primary account resolves channels."""
-        if self.is_primary:
-            await self._manager.resolve_if_triggered(self.client)
+        """Passed to CopyEngine: keep checking channels even while this account is busy."""
+        await self._check_channels()
+
+    async def _check_channels(self, force: bool = False) -> None:
+        """Record this account's access to every channel it hasn't probed yet."""
+        from app.worker import worker_main
+
+        if self._manager.consume_resolve_trigger():
+            force = True
+        now = asyncio.get_running_loop().time()
+        if not force and now - self._last_channel_check < _CHANNEL_CHECK_EVERY_S:
+            return
+        self._last_channel_check = now
+        try:
+            await worker_main.check_channels_for_account(self.client, self.userbot.id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Userbot %s: channel access check failed: %s", self.label, e)
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -195,6 +218,9 @@ class UserbotRunner:
                     if handled:
                         continue
 
+                # Idle: cheap enough to run every poll, so a channel added or
+                # refreshed from the UI is re-checked by every account at once.
+                await self._check_channels(force=True)
                 await self._sleep(poll_interval)
 
             except asyncio.CancelledError:
@@ -525,16 +551,22 @@ class UserbotManager:
 
     # ── Primary-only duties (delegated back to worker_main) ───────────────────
 
-    async def resolve_if_triggered(self, client: TelegramClient) -> None:
-        from app.worker import worker_main
+    def consume_resolve_trigger(self) -> bool:
+        """
+        True once after the bot asks for an immediate channel check.
+
+        Only an accelerator: the checks are driven by the DB, so a runner that
+        misses the trigger still picks the work up on its next cycle.
+        """
         if self._resolve_trigger is not None and self._resolve_trigger.is_set():
             self._resolve_trigger.clear()
-            await worker_main.resolve_pending_channels(client)
+            return True
+        return False
 
     async def run_primary_duties(self, client: TelegramClient) -> bool:
-        """Scans, bulk deletes and channel resolution. True if real work happened."""
+        """Scans and bulk deletes. True if real work happened."""
         from app.worker import worker_main
-        return await worker_main.run_primary_duties(client, self._resolve_trigger)
+        return await worker_main.run_primary_duties(client)
 
     async def daily_limit_reached(
         self, client: TelegramClient, job_id: int, userbot_id: int

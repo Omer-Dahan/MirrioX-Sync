@@ -121,6 +121,21 @@ _NOT_EXCLUDED = (
     "OR ',' || excluded_userbot_ids || ',' NOT LIKE '%,' || ? || ',%')"
 )
 
+# Nor a job whose source or destination this account is *known* to have no access
+# to — channel_access turns what the exclusion list rediscovers per job into a
+# per-channel fact every job benefits from, so no cycle is wasted claiming work
+# that can only fail.
+#
+# Deliberately a negative test: a channel this account hasn't probed yet stays
+# claimable. Requiring a positive result instead would stall the whole queue
+# whenever the checks lag behind (or no account has probed a brand-new channel).
+_NO_KNOWN_LACK_OF_ACCESS = (
+    "NOT EXISTS (SELECT 1 FROM channel_access ca "
+    "WHERE ca.userbot_id = ? AND ca.has_access = 0 "
+    "AND ((ca.channel_kind = 'source' AND ca.channel_id = jobs.source_id) "
+    "OR (ca.channel_kind = 'destination' AND ca.channel_id = jobs.destination_id)))"
+)
+
 
 def claim_next_job(userbot_id: int) -> Optional[Job]:
     """
@@ -132,7 +147,8 @@ def claim_next_job(userbot_id: int) -> Optional[Job]:
     jobs sort last, keeping them the low-priority background work they are.
 
     Ready retries come first, then pending jobs in submit order. Jobs this
-    userbot was excluded from (not a channel member) are never returned.
+    userbot was excluded from, or whose channels it is known to have no access
+    to, are never returned.
     """
     conn = db.get_connection()
     row = conn.execute(
@@ -145,11 +161,12 @@ def claim_next_job(userbot_id: int) -> Optional[Job]:
                         AND (next_retry_at IS NULL OR next_retry_at <= datetime('now')))
               )
               AND {_NOT_EXCLUDED}
+              AND {_NO_KNOWN_LACK_OF_ACCESS}
             ORDER BY COALESCE(continuous,0) ASC,
                      CASE status WHEN 'waiting_retry' THEN 1 ELSE 2 END,
                      COALESCE(submitted_at, created_at) ASC, id ASC
-            LIMIT 1""",  # nosec B608 — _NOT_EXCLUDED is a fixed fragment with a bound param
-        (str(userbot_id),),
+            LIMIT 1""",  # nosec B608 — fixed fragments with bound params
+        (str(userbot_id), userbot_id),
     ).fetchone()
     if row is None:
         return None
@@ -186,9 +203,10 @@ def claim_continuous_job(userbot_id: int) -> Optional[Job]:
               AND assigned_userbot_id IS NULL
               AND status IN ('pending','running')
               AND {_NOT_EXCLUDED}
+              AND {_NO_KNOWN_LACK_OF_ACCESS}
             ORDER BY COALESCE(submitted_at, created_at) ASC, id ASC
-            LIMIT 1""",  # nosec B608 — _NOT_EXCLUDED is a fixed fragment with a bound param
-        (str(userbot_id),),
+            LIMIT 1""",  # nosec B608 — fixed fragments with bound params
+        (str(userbot_id), userbot_id),
     ).fetchone()
     if row is None:
         return None

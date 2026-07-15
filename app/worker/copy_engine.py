@@ -421,16 +421,21 @@ class CopyEngine:
                         if _msgs_since_limit_check >= 100 and self._userbot_id is not None:
                             _msgs_since_limit_check = 0
                             from app.ui.texts import DAILY_LIMIT
-                            # Per-account, matching the pre-job check: one capped
-                            # account must not stop the others.
+                            # The cap belongs to this account, not to the job: hand
+                            # the job back so an account with budget resumes it from
+                            # the checkpoint (copied_messages stops any re-copying).
+                            # This runner stops claiming until midnight, so it cannot
+                            # take the job straight back. Only when every account is
+                            # capped does the job wait — park_queue_if_all_capped.
                             count_today = job_repo.get_daily_count_for_userbot(self._userbot_id)
                             if count_today >= DAILY_LIMIT:
                                 logger.warning(
-                                    "Job #%d: userbot #%d hit its daily limit mid-job (%d msgs) — pausing at msg #%d",
+                                    "Job #%d: userbot #%d hit its daily limit mid-job (%d msgs) — "
+                                    "releasing at msg #%d for another account",
                                     job.id, self._userbot_id, count_today, msg.id,
                                 )
                                 job_repo.update_progress(job.id, copied, skipped, failed, msg.id)
-                                job_repo.pause_job(job.id)
+                                job_repo.release_job(job.id, "pending")
                                 return
 
                         await self._rate_limiter.wait()

@@ -83,6 +83,7 @@ class UserbotRunner:
         self._live_lock = asyncio.Lock()          # serialises live sends on this account
         self._last_reconcile = 0.0
         self._last_channel_check = 0.0
+        self._capped_logged = False
 
     @property
     def id(self) -> int:
@@ -208,10 +209,13 @@ class UserbotRunner:
 
                 await self._reconcile_listeners()
 
-                job = job_repo.claim_next_job(self.userbot.id)
-                if job is not None:
-                    await self._run_claimed_job(job)
-                    continue
+                # An account that has spent its daily quota stops taking work —
+                # it must never park a job that an account with budget could run.
+                if not self._is_capped():
+                    job = job_repo.claim_next_job(self.userbot.id)
+                    if job is not None:
+                        await self._run_claimed_job(job)
+                        continue
 
                 if self.is_primary:
                     handled = await self._manager.run_primary_duties(self.client)
@@ -228,6 +232,22 @@ class UserbotRunner:
             except Exception as e:
                 logger.exception("Userbot %s: poll loop error: %s", self.label, e)
                 await self._sleep(10)
+
+    def _is_capped(self) -> bool:
+        """True while this account is out of daily quota. Logged once per transition."""
+        from app.worker import worker_main
+
+        capped = worker_main.account_is_capped(self.userbot.id)
+        if capped != self._capped_logged:
+            self._capped_logged = capped
+            if capped:
+                logger.info(
+                    "Userbot %s: daily quota spent — not claiming until midnight "
+                    "(other accounts keep working)", self.label,
+                )
+            else:
+                logger.info("Userbot %s: daily quota reset — claiming again", self.label)
+        return capped
 
     async def _ensure_connected(self) -> bool:
         if self.client is not None and self.client.is_connected():
@@ -275,10 +295,6 @@ class UserbotRunner:
         )
         self._manager.mark_busy(self.userbot.id, job.id)
         try:
-            if await self._manager.daily_limit_reached(self.client, job.id, self.userbot.id):
-                job_repo.clear_assignment(job.id, owner_id=self.userbot.id)
-                return
-
             await self.engine.run_job(job)
             job_repo.clear_assignment(job.id, owner_id=self.userbot.id)
             await self._manager.notify_job_done(self.client, job.id)
@@ -412,15 +428,17 @@ class UserbotRunner:
             return
         self._last_reconcile = now
 
-        # Claim any continuous job not yet owned by an account.
-        for _ in range(_MAX_CONTINUOUS_CLAIMS_PER_CYCLE):
-            claimed = job_repo.claim_continuous_job(self.userbot.id)
-            if claimed is None:
-                break
-            logger.info(
-                "Userbot %s: claimed continuous job #%d '%s'",
-                self.label, claimed.id, claimed.name,
-            )
+        # Claim any continuous job not yet owned by an account. A capped account
+        # takes no new listeners — an account with budget should get them instead.
+        if not self._is_capped():
+            for _ in range(_MAX_CONTINUOUS_CLAIMS_PER_CYCLE):
+                claimed = job_repo.claim_continuous_job(self.userbot.id)
+                if claimed is None:
+                    break
+                logger.info(
+                    "Userbot %s: claimed continuous job #%d '%s'",
+                    self.label, claimed.id, claimed.name,
+                )
 
         active_jobs = job_repo.get_continuous_jobs_for(self.userbot.id)
         active_ids = {j.id for j in active_jobs}
@@ -567,12 +585,6 @@ class UserbotManager:
         """Scans and bulk deletes. True if real work happened."""
         from app.worker import worker_main
         return await worker_main.run_primary_duties(client)
-
-    async def daily_limit_reached(
-        self, client: TelegramClient, job_id: int, userbot_id: int
-    ) -> bool:
-        from app.worker import worker_main
-        return await worker_main.check_daily_limit(client, job_id, userbot_id)
 
     async def notify_job_done(self, client: TelegramClient, job_id: int) -> None:
         from app.worker import worker_main

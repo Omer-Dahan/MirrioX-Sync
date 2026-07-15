@@ -142,6 +142,7 @@ async def run_primary_duties(client: TelegramClient) -> bool:
         return True
 
     state_repo.heartbeat()
+    await park_queue_if_all_capped(client)
     return False
 
 
@@ -431,75 +432,89 @@ async def send_delete_completion_notification(
     logger.info("Delete job #%d: completion notification sent", delete_job_id)
 
 
-async def check_daily_limit(client: TelegramClient, job_id: int, userbot_id: int) -> bool:
+def account_is_capped(userbot_id: int) -> bool:
     """
-    Check whether *this account* has hit its daily transfer limit.
+    True once this account has copied its DAILY_LIMIT for the day.
 
-    Telegram enforces its limits per account, so the cap is counted per userbot:
-    each account gets its own DAILY_LIMIT and adding accounts genuinely raises
-    total daily throughput. A capped account defers only its own job to midnight;
-    the other accounts keep working.
-
-    Returns True if the limit is hit (caller should skip this job).
+    Telegram enforces its limits per account, so the cap is a fact about the
+    *account*, never about the job: a capped account simply stops claiming work
+    (see UserbotRunner._loop) while the others keep going at full speed. Only
+    when every active account is capped does the queue wait — park_queue_if_all_capped.
     """
     from app.ui.texts import DAILY_LIMIT
 
-    count_today = job_repo.get_daily_count_for_userbot(userbot_id)
-    if count_today < DAILY_LIMIT:
-        return False
+    return job_repo.get_daily_count_for_userbot(userbot_id) >= DAILY_LIMIT
 
-    # Limit reached — compute next midnight in Israel time
+
+def _next_midnight_il() -> datetime:
     from datetime import timezone
     from zoneinfo import ZoneInfo
-    _IL = ZoneInfo("Asia/Jerusalem")
-    now_il = datetime.now(timezone.utc).astimezone(_IL)
-    next_midnight_il = (now_il + timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    next_midnight_utc = next_midnight_il.astimezone(timezone.utc)
-    retry_at = next_midnight_utc.strftime("%Y-%m-%d %H:%M:%S")
 
-    job_repo.update_status(
-        job_id,
-        "waiting_retry",
-        error=f"הגבלה יומית לחשבון: {DAILY_LIMIT:,} הודעות הועברו היום",
-        next_retry_at=retry_at,
-    )
-    logger.warning(
-        "Job #%d: userbot #%d hit its daily limit (%d msgs today) — rescheduled to %s",
-        job_id, userbot_id, count_today, retry_at,
-    )
-    await send_daily_limit_notification(client, job_id, count_today, next_midnight_il, userbot_id)
-    return True
+    now_il = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Jerusalem"))
+    return (now_il + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+async def park_queue_if_all_capped(client: TelegramClient) -> None:
+    """
+    Hold the queue until midnight only when *no* account has budget left.
+
+    Without this the queue would sit at 'pending' with nobody able to claim it and
+    no word to the admin. With it, the wait is explicit and announced — and it can
+    never happen while a single account still has quota to spend.
+    """
+    from app.ui.texts import DAILY_LIMIT
+
+    active = userbot_repo.get_active()
+    if not active:
+        return
+    if any(not account_is_capped(u.id) for u in active):
+        return
+
+    parked = job_repo.get_all(status_filter=["pending"])
+    if not parked:
+        return
+
+    next_midnight_il = _next_midnight_il()
+    from datetime import timezone
+    retry_at = next_midnight_il.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    for job in parked:
+        job_repo.update_status(
+            job.id,
+            "waiting_retry",
+            error=f"הגבלה יומית: כל החשבונות העבירו {DAILY_LIMIT:,} הודעות היום",
+            next_retry_at=retry_at,
+        )
+        logger.warning(
+            "Job #%d: every active account (%d) is out of daily quota — parked until %s",
+            job.id, len(active), retry_at,
+        )
+        await send_daily_limit_notification(client, job.id, next_midnight_il)
 
 
 async def send_daily_limit_notification(
-    client: TelegramClient,
-    job_id: int,
-    count_today: int,
-    next_midnight_il,
-    userbot_id: int | None = None,
+    client: TelegramClient, job_id: int, next_midnight_il
 ) -> None:
-    """Notify the admin that an account hit its daily limit and its job is deferred."""
-    from app.ui.texts import DAILY_LIMIT
+    """Tell the admin the queue is out of daily quota on every account."""
+    from app.ui.texts import DAILY_LIMIT, esc
 
     job = job_repo.get_by_id(job_id)
-    job_name = job.name if job else f"#{job_id}"
+    job_name = esc(job.name) if job else f"#{job_id}"
     resume_time = next_midnight_il.strftime("%d/%m/%Y 00:00")
 
-    account_line = ""
-    if userbot_id is not None:
-        ub = userbot_repo.get_by_id(userbot_id)
-        if ub:
-            account_line = f"🤖 חשבון: <b>{ub.display()}</b>\n"
+    accounts = "\n".join(
+        f"🔸 {esc(ub.display())}: <b>{job_repo.get_daily_count_for_userbot(ub.id):,}</b>"
+        f" / {DAILY_LIMIT:,}"
+        for ub in userbot_repo.get_active()
+    )
 
     text = (
         f"⏸ <b>הגבלה יומית הושגה</b>\n\n"
-        f"📋 משימה: <b>{job_name}</b>\n"
-        f"{account_line}"
-        f"📊 הועברו היום בחשבון זה: <b>{count_today:,}</b> / {DAILY_LIMIT:,} הודעות\n\n"
+        f"📋 משימה: <b>{job_name}</b>\n\n"
+        f"כל חשבונות היוזרבוט מיצו את המכסה היומית:\n"
+        f"{accounts}\n\n"
         f"🕛 המשימה תמשיך אוטומטית מחר בחצות ({resume_time}).\n"
-        f"<i>חשבונות אחרים ממשיכים לעבוד כרגיל.</i>"
+        f"<i>הוספת חשבון נוסף תגדיל את המכסה הכוללת.</i>"
     )
 
     await _notify(state_repo.get_setting("main_chat_id"), text, job_id, "daily_limit")

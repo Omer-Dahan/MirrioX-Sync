@@ -5,6 +5,12 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Optional
 
+# Content types a job can copy, as classified by CopyEngine._get_content_type.
+# Anything the classifier can't place lands outside this set and is only copied
+# when every type is selected — see the filter shortcut in copy_engine.
+ALL_CONTENT_TYPES = frozenset({"text", "image", "video", "file"})
+DEFAULT_CONTENT_TYPES = "file,image,text,video"
+
 
 @dataclass
 class Admin:
@@ -153,7 +159,7 @@ class Job:
     use_blocked_words: bool
     group_media: bool
     copy_text: bool
-    content_types: str  # comma-separated: text,image,video
+    content_types: str  # comma-separated subset of ALL_CONTENT_TYPES
     report_url: Optional[str]
     status: str
     created_at: str
@@ -193,7 +199,7 @@ class Job:
             use_blocked_words=bool(row["use_blocked_words"]),
             group_media=bool(row["group_media"]) if "group_media" in row.keys() else True,
             copy_text=bool(row["copy_text"]) if "copy_text" in row.keys() else True,
-            content_types=row["content_types"] if "content_types" in row.keys() else "text,image,video",
+            content_types=row["content_types"] if "content_types" in row.keys() else DEFAULT_CONTENT_TYPES,
             report_url=row["report_url"] if "report_url" in row.keys() else None,
             status=row["status"],
             created_at=row["created_at"],

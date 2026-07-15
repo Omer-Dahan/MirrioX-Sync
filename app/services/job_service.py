@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from app.models import Job, JobError
+from app.models import DEFAULT_CONTENT_TYPES, Job, JobError
 from app.repositories import job_repo, source_repo
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ def create_draft_job(
     use_blocked_words: bool = True,
     group_media: bool = True,
     copy_text: bool = True,
-    content_types: str = "text,image,video",
+    content_types: str = DEFAULT_CONTENT_TYPES,
     created_by: Optional[int] = None,
     continuous: bool = False,
 ) -> Job:

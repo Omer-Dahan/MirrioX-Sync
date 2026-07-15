@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+# Safe at runtime: app.models imports nothing from app, so there is no cycle.
+from app.models import ALL_CONTENT_TYPES, DEFAULT_CONTENT_TYPES
+
 if TYPE_CHECKING:
     from app.models import Job, Source, Destination, Admin, BlockedWord, WorkerState, Userbot
 
@@ -334,9 +337,9 @@ def job_detail_text(
     mode_label = MODE_LABELS.get(job.mode, job.mode)
 
     filter_str = "כן" if job.use_blocked_words else "לא"
-    ct_parts = [p.strip() for p in (job.content_types or "text,image,video").split(",") if p.strip()]
-    ct_map = {"image": "תמונות", "video": "סרטונים", "text": "טקסט"}
-    ct_str = ", ".join(ct_map[p] for p in ("image", "video", "text") if p in ct_parts) or "—"
+    ct_parts = [p.strip() for p in (job.content_types or DEFAULT_CONTENT_TYPES).split(",") if p.strip()]
+    ct_map = {"image": "תמונות", "video": "סרטונים", "file": "קבצים", "text": "טקסט"}
+    ct_str = ", ".join(ct_map[p] for p in ("image", "video", "file", "text") if p in ct_parts) or "—"
 
     params_line = ""
     if job.mode == "date_range":
@@ -463,12 +466,14 @@ def wizard_summary_text(partial: dict, word_count: int) -> str:
     text_status = "כן" if partial.get("copy_text", True) else "לא"
     continuous = partial.get("continuous", False)
 
-    ct_set = partial.get("content_types", {"text", "image", "video"})
+    ct_set = partial.get("content_types", set(ALL_CONTENT_TYPES))
     ct_labels = []
     if "image" in ct_set:
         ct_labels.append("🖼 תמונות")
     if "video" in ct_set:
         ct_labels.append("🎬 סרטונים")
+    if "file" in ct_set:
+        ct_labels.append("📎 קבצים")
     if "text" in ct_set:
         ct_labels.append("💬 טקסט")
     content_types_str = ", ".join(ct_labels) if ct_labels else "—"

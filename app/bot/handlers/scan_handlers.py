@@ -81,7 +81,6 @@ async def dispatch_scan(bot: TelegramClient, event, uid: int) -> None:
         ref = parts[4]
         from telegram import InlineKeyboardMarkup
         from app.ui.keyboards import _btn, to_telethon as _to_telethon
-        from app.ui import texts
         kb = InlineKeyboardMarkup([
             [_btn(texts.BTN_YES_DELETE, f"scan:delete:{scan_id}:{page}:{ref}")],
             [_btn(texts.BTN_CANCEL, f"scan:hist:{ref}:{page}"),]

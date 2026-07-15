@@ -255,7 +255,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     )
     _add_column_if_missing(conn, "sources",       "validation_error",   "TEXT")
     _add_column_if_missing(conn, "destinations",  "validation_error",   "TEXT")
-    _add_column_if_missing(conn, "jobs",          "content_types",      "TEXT DEFAULT 'text,image,video'")
+    _add_column_if_missing(conn, "jobs",          "content_types",      "TEXT DEFAULT 'file,image,text,video'")
+    _migrate_content_types_add_file(conn)
     _add_column_if_missing(conn, "jobs",          "report_url",         "TEXT")
     _add_column_if_missing(conn, "jobs",          "group_media",        "INTEGER DEFAULT 1")
     _add_column_if_missing(conn, "jobs",          "copy_text",          "INTEGER DEFAULT 1")
@@ -477,6 +478,33 @@ def _migrate_copied_messages_remove_fk(conn: sqlite3.Connection) -> None:
     except Exception:
         logger.exception("Migration _migrate_copied_messages_remove_fk failed — skipping")
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_content_types_add_file(conn: sqlite3.Connection) -> None:
+    """
+    Introduce the 'file' content type without changing what existing jobs copy.
+
+    Before this type existed, selecting all types meant "copy everything" — the
+    content filter was skipped entirely, so documents came through. Now that
+    'file' is selectable, those same rows would read as a strict subset and
+    start dropping documents silently. Widen them to keep their old meaning.
+
+    Guarded by user_version because it must run exactly once: after the upgrade
+    a user may deliberately clear the 'file' checkbox, and re-running this would
+    force it back on at every startup.
+    """
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 1:
+        return
+    # Both orderings exist in the wild: the wizard stores sorted(), while rows
+    # backfilled by the old column default kept the literal 'text,image,video'.
+    cur = conn.execute(
+        "UPDATE jobs SET content_types = 'file,image,text,video' "
+        "WHERE content_types IN ('text,image,video', 'image,text,video')"
+    )
+    conn.execute("PRAGMA user_version = 1")
+    logger.info(
+        "Migration: added 'file' content type to %d existing job(s)", cur.rowcount
+    )
 
 
 def _add_column_if_missing(

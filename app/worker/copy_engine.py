@@ -21,7 +21,7 @@ from telethon.tl.types import (
     MessageMediaUnsupported,
 )
 
-from app.models import Job, NoAccessError
+from app.models import ALL_CONTENT_TYPES, DEFAULT_CONTENT_TYPES, Job, NoAccessError
 from app.repositories import job_repo, filter_repo, source_repo, dedup_repo
 from app.worker.rate_limiter import RateLimiter
 
@@ -146,7 +146,7 @@ class CopyEngine:
             checkpoint = buffer[-1].id
 
             # Apply per-message filters; collect messages that should be sent
-            allowed_types: set[str] = set((job.content_types or "text,image,video").split(","))
+            allowed_types: set[str] = set((job.content_types or DEFAULT_CONTENT_TYPES).split(","))
             to_send: list[Message] = []
             for m in buffer:
                 if not job.copy_text and (not m.media or isinstance(m.media, MessageMediaUnsupported)):
@@ -159,7 +159,7 @@ class CopyEngine:
                     already_done.add(m.id)
                     skipped += 1
                     continue
-                if allowed_types != {"image", "text", "video"}:
+                if allowed_types != ALL_CONTENT_TYPES:
                     msg_type = self._get_content_type(m)
                     if msg_type not in allowed_types:
                         job_repo.record_copied_message(job.id, m.id, None, "skipped", f"content_type:{msg_type}", userbot_id=self._userbot_id)
@@ -569,7 +569,7 @@ class CopyEngine:
             logger.debug("Job #%d: group %d blocked by filter", job.id, group[0].grouped_id)
             return [("skipped", "blocked_word")] * len(group), src_is_protected
 
-        allowed_types: set[str] = set((job.content_types or "text,image,video").split(","))
+        allowed_types: set[str] = set((job.content_types or DEFAULT_CONTENT_TYPES).split(","))
 
         final_statuses: list[tuple[str, Optional[str]]] = []
         send_group: list[Message] = []
@@ -580,7 +580,7 @@ class CopyEngine:
                 final_statuses.append(("skipped", "text_stripped_empty"))
                 continue
             
-            if allowed_types != {"image", "text", "video"}:
+            if allowed_types != ALL_CONTENT_TYPES:
                 msg_type = self._get_content_type(m)
                 if msg_type not in allowed_types:
                     final_statuses.append(("skipped", f"content_type:{msg_type}"))
@@ -686,8 +686,8 @@ class CopyEngine:
             return "skipped", "duplicate", src_is_protected
 
         # Content type filter
-        allowed_types: set[str] = set((job.content_types or "text,image,video").split(","))
-        if allowed_types != {"image", "text", "video"}:
+        allowed_types: set[str] = set((job.content_types or DEFAULT_CONTENT_TYPES).split(","))
+        if allowed_types != ALL_CONTENT_TYPES:
             msg_type = self._get_content_type(msg)
             if msg_type not in allowed_types:
                 logger.debug("Job #%d: msg #%d skipped (type=%s not in %s)", job.id, msg.id, msg_type, allowed_types)
@@ -852,7 +852,27 @@ class CopyEngine:
             # Media could not be downloaded (e.g. forwarded from protected channel)
             raise RuntimeError("download_failed: media returned None (protected or unavailable)")
 
-        await self._client.send_file(dst_entity, file_bytes, caption=text or None)
+        # Raw bytes carry no filename, so Telethon would upload a PDF as "unnamed"
+        # and strip an audio track's title. Replaying the source attributes fixes
+        # that, and force_document keeps a document a document instead of letting
+        # Telethon sniff an image file back into a photo.
+        # Documents only: photos have no attributes to replay, and Telegram
+        # rejects a sticker's attributes on a fresh upload.
+        attributes = None
+        force_document = False
+        if self._get_content_type(msg) == "file":
+            doc = getattr(msg.media, "document", None)
+            if doc:
+                attributes = list(doc.attributes)
+                force_document = True
+
+        await self._client.send_file(
+            dst_entity,
+            file_bytes,
+            caption=text or None,
+            attributes=attributes,
+            force_document=force_document,
+        )
 
     async def _send_group_by_ref(self, group: list[Message], dst_entity, copy_text: bool = True) -> None:
         """
@@ -986,7 +1006,7 @@ class CopyEngine:
 
     @staticmethod
     def _get_content_type(msg: Message) -> str:
-        """Classify message as 'text', 'image', 'video', or 'other'."""
+        """Classify message as 'text', 'image', 'video', 'file', or 'other'."""
         if not msg.media or isinstance(msg.media, MessageMediaUnsupported):
             return "text"
         type_name = msg.media.__class__.__name__
@@ -1001,6 +1021,10 @@ class CopyEngine:
                         return "image"
                     if cls in ("DocumentAttributeVideo", "DocumentAttributeAnimated"):
                         return "video"
+                # Any other document: PDF, archive, music, voice note.
+                # Only with a document to send — an expired one stays 'other'
+                # so the filter drops it instead of failing the copy.
+                return "file"
         return "other"
 
     def _is_supported_type(self, msg: Message) -> bool:

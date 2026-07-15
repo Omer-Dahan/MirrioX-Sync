@@ -24,8 +24,9 @@ Thumbs.db
 *.md
 !README.md
 
-# PID file
+# PID files (one per run mode: bot-only, combined)
 mirriox.pid
+mirriox.all.pid
 
 # Application Data & Database
 *.db

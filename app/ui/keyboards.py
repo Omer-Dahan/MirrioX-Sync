@@ -201,6 +201,7 @@ def kb_wizard_content_types(selected: set) -> InlineKeyboardMarkup:
     rows = [
         [_btn(f"{chk('image')} 🖼 תמונות (ומדבקות)", "wzd:toggle_type:image")],
         [_btn(f"{chk('video')} 🎬 סרטונים (וGIF)", "wzd:toggle_type:video")],
+        [_btn(f"{chk('file')} 📎 קבצים (מסמכים ואודיו)", "wzd:toggle_type:file")],
         [_btn(f"{chk('text')} 💬 טקסט", "wzd:toggle_type:text")],
     ]
     if selected:

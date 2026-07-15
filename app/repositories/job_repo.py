@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 from app import db
-from app.models import Job
+from app.models import DEFAULT_CONTENT_TYPES, Job
 
 
 def create(
@@ -19,7 +19,7 @@ def create(
     use_blocked_words: bool = True,
     group_media: bool = True,
     copy_text: bool = True,
-    content_types: str = "text,image,video",
+    content_types: str = DEFAULT_CONTENT_TYPES,
     created_by: Optional[int] = None,
     continuous: bool = False,
 ) -> Job:

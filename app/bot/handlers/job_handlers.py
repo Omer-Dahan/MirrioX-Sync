@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from telethon import TelegramClient
 
-from app.models import JobError, ValidationError
+from app.models import ALL_CONTENT_TYPES, DEFAULT_CONTENT_TYPES, JobError, ValidationError
 from app.repositories import source_repo, filter_repo
 from app.services import job_service, validation_service
 from app.ui import renderer, texts, keyboards
@@ -180,7 +180,7 @@ def _init_wizard(uid: int) -> dict:
         "group_media": True,
         "copy_text": True,
         "continuous": False,
-        "content_types": {"text", "image", "video"},
+        "content_types": set(ALL_CONTENT_TYPES),
     }
     return ud["wizard"]
 
@@ -354,7 +354,7 @@ async def _wizard_show_mode_select(bot: TelegramClient, w: dict) -> None:
 
 
 async def _wizard_show_content_types(bot: TelegramClient, w: dict) -> None:
-    selected: set = w.setdefault("content_types", {"text", "image", "video"})
+    selected: set = w.setdefault("content_types", set(ALL_CONTENT_TYPES))
     text, kb = renderer.render_wizard_step(texts.WIZARD_SELECT_CONTENT_TYPES, w, keyboards.kb_wizard_content_types(selected))
     await update_main_message(bot, text, to_telethon(kb))
 
@@ -363,7 +363,7 @@ async def _wizard_toggle_type(bot: TelegramClient, uid: int, type_name: str) -> 
     w = _get_wizard(uid)
     if not w:
         return
-    selected: set = w.setdefault("content_types", {"text", "image", "video"})
+    selected: set = w.setdefault("content_types", set(ALL_CONTENT_TYPES))
     if type_name in selected:
         selected.discard(type_name)
     else:
@@ -419,8 +419,8 @@ async def _wizard_confirm(bot: TelegramClient, uid: int) -> None:
             else:
                 job_name = name_base
 
-            ct_set: set = w.get("content_types", {"text", "image", "video"})
-            content_types_str = ",".join(sorted(ct_set)) if ct_set else "text,image,video"
+            ct_set: set = w.get("content_types", set(ALL_CONTENT_TYPES))
+            content_types_str = ",".join(sorted(ct_set)) if ct_set else DEFAULT_CONTENT_TYPES
 
             job = job_service.create_draft_job(
                 name=job_name,

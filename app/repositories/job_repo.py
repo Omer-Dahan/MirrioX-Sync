@@ -455,24 +455,46 @@ def mark_completed(job_id: int) -> None:
     conn.commit()
 
 
-def update_progress(
+def add_progress(
     job_id: int,
-    copied: int,
-    skipped: int,
-    failed: int,
-    last_processed_id: int,
+    copied: int = 0,
+    skipped: int = 0,
+    failed: int = 0,
+    last_processed_id: Optional[int] = None,
 ) -> None:
+    """
+    Add to a job's counters.
+
+    Deliberately additive rather than absolute: a sharded job is copied by several
+    accounts at once, and each only knows its own tally. Writing absolute totals
+    would make every account overwrite the others' progress.
+
+    last_processed_id is the job-wide checkpoint and only means anything for an
+    unsharded, strictly ascending run — a sharded job keeps a checkpoint per chunk
+    instead, so its callers leave this None.
+    """
     conn = db.get_connection()
-    conn.execute(
-        """UPDATE jobs SET
-             copied_count = ?,
-             skipped_count = ?,
-             failed_count = ?,
-             last_processed_id = ?,
-             last_updated_at = datetime('now')
-           WHERE id = ?""",
-        (copied, skipped, failed, last_processed_id, job_id),
-    )
+    if last_processed_id is None:
+        conn.execute(
+            """UPDATE jobs SET
+                 copied_count = COALESCE(copied_count,0) + ?,
+                 skipped_count = COALESCE(skipped_count,0) + ?,
+                 failed_count = COALESCE(failed_count,0) + ?,
+                 last_updated_at = datetime('now')
+               WHERE id = ?""",
+            (copied, skipped, failed, job_id),
+        )
+    else:
+        conn.execute(
+            """UPDATE jobs SET
+                 copied_count = COALESCE(copied_count,0) + ?,
+                 skipped_count = COALESCE(skipped_count,0) + ?,
+                 failed_count = COALESCE(failed_count,0) + ?,
+                 last_processed_id = ?,
+                 last_updated_at = datetime('now')
+               WHERE id = ?""",
+            (copied, skipped, failed, last_processed_id, job_id),
+        )
     conn.commit()
 
 
@@ -548,6 +570,9 @@ def is_cancelled(job_id: int) -> bool:
 
 def delete(job_id: int) -> bool:
     conn = db.get_connection()
+    # Chunks have no FK to jobs (copied_messages taught us that a FK here costs us
+    # the stats), so they have to be cleared explicitly or they outlive the job.
+    conn.execute("DELETE FROM job_chunks WHERE job_id = ?", (job_id,))
     cur = conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     conn.commit()
     return cur.rowcount > 0
@@ -738,12 +763,28 @@ def is_message_processed(job_id: int, source_message_id: int) -> bool:
     return row is not None
 
 
-def get_copied_source_ids(job_id: int) -> set[int]:
-    """Return all source_message_ids already processed for this job."""
+def get_copied_source_ids(
+    job_id: int,
+    id_from: Optional[int] = None,
+    id_to: Optional[int] = None,
+) -> set[int]:
+    """
+    Source message IDs already processed for this job.
+
+    Pass id_from/id_to when running one chunk of a sharded job: only that slice is
+    needed, and loading a large job's whole history for every chunk would be waste.
+    """
     conn = db.get_connection()
-    rows = conn.execute(
-        "SELECT source_message_id FROM copied_messages WHERE job_id = ?", (job_id,)
-    ).fetchall()
+    if id_from is None or id_to is None:
+        rows = conn.execute(
+            "SELECT source_message_id FROM copied_messages WHERE job_id = ?", (job_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT source_message_id FROM copied_messages
+               WHERE job_id = ? AND source_message_id BETWEEN ? AND ?""",
+            (job_id, id_from, id_to),
+        ).fetchall()
     return {r["source_message_id"] for r in rows}
 
 

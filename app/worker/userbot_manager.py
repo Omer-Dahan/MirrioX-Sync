@@ -7,7 +7,13 @@ same time — parallelism is bounded by the number of active accounts.
 
 Job hand-off rules:
   - Jobs are claimed atomically (`job_repo.claim_next_job`), so two accounts can
-    never run the same job.
+    never lead the same job.
+  - A job whose channels two or more accounts can reach is split into chunks by
+    its leader. Any account that finds nothing new in the queue joins a running
+    job by claiming a free chunk (`job_chunk_repo.claim_any`), so one job is
+    copied by several accounts at once. New work in the queue is preferred over
+    joining, which keeps whole jobs — and their message order — intact whenever
+    there is enough work to go round.
   - If a runner cannot reach a job's channels it raises NoAccessError; the job is
     released back to the queue and that account is excluded from it, so a
     different account picks it up. Only when *every* active account has been
@@ -30,9 +36,9 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 
 from app.config import Config
-from app.models import Job, NoAccessError, Userbot
+from app.models import Job, JobChunk, NoAccessError, Userbot
 from app.network_errors import is_network_error
-from app.repositories import job_repo, state_repo, userbot_repo, source_repo
+from app.repositories import job_repo, job_chunk_repo, state_repo, userbot_repo, source_repo
 from app.worker.copy_engine import CopyEngine
 
 logger = logging.getLogger(__name__)
@@ -184,12 +190,17 @@ class UserbotRunner:
             logger.info("Userbot %s: stopped", self.label)
 
     def _release_continuous(self) -> None:
-        """Hand this account's continuous jobs back so another account resumes them."""
+        """Hand this account's continuous jobs and chunks back to the other accounts."""
         released = job_repo.release_continuous_jobs(self.userbot.id)
         if released:
             logger.info(
                 "Userbot %s: released %d continuous job(s) for another account to take over",
                 self.label, released,
+            )
+        chunks = job_chunk_repo.release_for_userbot(self.userbot.id)
+        if chunks:
+            logger.info(
+                "Userbot %s: released %d job chunk(s) back to the queue", self.label, chunks
             )
 
     async def _loop(self) -> None:
@@ -215,6 +226,15 @@ class UserbotRunner:
                     job = job_repo.claim_next_job(self.userbot.id)
                     if job is not None:
                         await self._run_claimed_job(job)
+                        continue
+
+                    # Nothing new to lead. Join a job another account is already
+                    # leading, if it was sharded — checked after claim_next_job so
+                    # a queue with enough work for everyone still hands each
+                    # account a whole job of its own.
+                    joined = job_chunk_repo.claim_any(self.userbot.id)
+                    if joined is not None:
+                        await self._run_claimed_chunk(*joined)
                         continue
 
                 if self.is_primary:
@@ -311,6 +331,68 @@ class UserbotRunner:
 
         except Exception as e:
             await self._handle_job_error(job, e)
+
+        finally:
+            self._manager.mark_idle(self.userbot.id)
+
+    async def _run_claimed_chunk(self, job: Job, chunk: JobChunk) -> None:
+        """
+        Copy one chunk of a job another account is leading.
+
+        Every failure path here is deliberately narrower than _run_claimed_job's:
+        the job belongs to its leader, which is copying its own chunks right now.
+        A helper that hits trouble hands its chunk back and gets out of the way —
+        pausing, failing or requeueing the job from here would yank it out from
+        under an account that is working perfectly well. run_chunk has already
+        released the chunk by the time any of this runs.
+        """
+        logger.info(
+            "Userbot %s: joined job #%d '%s' on chunk #%d (ids %d–%d)",
+            self.label, job.id, job.name, chunk.id, chunk.id_from, chunk.id_to,
+        )
+        self._manager.mark_busy(self.userbot.id, job.id)
+        try:
+            await self.engine.run_chunk(job, chunk)
+
+        except NoAccessError as e:
+            # Access is per-account: this one can't reach the channels even though
+            # the leader can. Exclude it so it stops being offered the job's chunks.
+            job_repo.exclude_userbot(job.id, self.userbot.id)
+            logger.info(
+                "Userbot %s: no access to job #%d (%s) — excluded from its chunks",
+                self.label, job.id, e,
+            )
+
+        except FloodWaitError as e:
+            # This account's flood wait, not the job's problem: the leader and the
+            # other helpers keep going at full speed.
+            logger.warning(
+                "Userbot %s: FloodWait %ds on job #%d chunk #%d — backing off",
+                self.label, e.seconds, job.id, chunk.id,
+            )
+            buf_min = state_repo.get_int_setting("flood_buffer_min_s", 5)
+            buf_max = state_repo.get_int_setting("flood_buffer_max_s", 10)
+            await self._sleep(e.seconds + random.uniform(buf_min, buf_max))  # nosec B311 — timing jitter
+
+        except asyncio.CancelledError:
+            job_chunk_repo.release(chunk.id, self.userbot.id)
+            raise
+
+        except Exception as e:
+            if is_network_error(e):
+                logger.warning(
+                    "Userbot %s: network error on job #%d chunk #%d (%s) — reconnecting",
+                    self.label, job.id, chunk.id, e,
+                )
+                await self._reconnect()
+            else:
+                logger.exception(
+                    "Userbot %s: job #%d chunk #%d failed: %s", self.label, job.id, chunk.id, e
+                )
+            # The chunk is back in the queue either way. If it is genuinely broken
+            # the leader will claim it in turn and fail the job through its own
+            # retry path, which is the only place that decision belongs.
+            await self._sleep(5)
 
         finally:
             self._manager.mark_idle(self.userbot.id)
@@ -636,9 +718,10 @@ class UserbotManager:
                 self._tasks.pop(ub_id, None)
                 self._runners.pop(ub_id, None)
                 self.mark_idle(ub_id)
-                # Belt and braces: the runner releases its own continuous jobs on
-                # the way out, but a hard crash could skip that.
+                # Belt and braces: the runner releases its own continuous jobs and
+                # chunks on the way out, but a hard crash could skip that.
                 job_repo.release_continuous_jobs(ub_id)
+                job_chunk_repo.release_for_userbot(ub_id)
 
         # Stop runners whose account is no longer active.
         for ub_id in list(self._tasks):
@@ -649,6 +732,7 @@ class UserbotManager:
                 self._runners.pop(ub_id, None)
                 self.mark_idle(ub_id)
                 job_repo.release_continuous_jobs(ub_id)
+                job_chunk_repo.release_for_userbot(ub_id)
 
         # Start runners for accounts that don't have one yet.
         primary_id = active[0].id if active else None

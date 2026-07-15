@@ -1,9 +1,22 @@
-"""Core copy logic using Telethon. Executes a single job end-to-end."""
+"""
+Core copy logic using Telethon. Executes a single job end-to-end.
+
+A job runs on one account by default: a single ascending pass, which is what
+keeps the destination in source order. When two or more accounts can reach both
+of the job's channels, the account that claimed the job becomes its *leader* and
+splits the source ID range into chunks (job_chunks). Every free account then
+claims chunks of its own, so one job is copied by several accounts at once. The
+leader works chunks like everyone else, but it also waits for the stragglers and
+owns the job's terminal state and report.
+"""
 # pylint: disable=too-many-branches,too-many-statements,too-many-locals
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import random
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional, Callable, Awaitable
 from zoneinfo import ZoneInfo
@@ -21,8 +34,8 @@ from telethon.tl.types import (
     MessageMediaUnsupported,
 )
 
-from app.models import ALL_CONTENT_TYPES, DEFAULT_CONTENT_TYPES, Job, NoAccessError
-from app.repositories import job_repo, filter_repo, source_repo, dedup_repo
+from app.models import ALL_CONTENT_TYPES, DEFAULT_CONTENT_TYPES, Job, JobChunk, NoAccessError
+from app.repositories import job_repo, job_chunk_repo, filter_repo, source_repo, dedup_repo
 from app.worker.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
@@ -30,6 +43,64 @@ logger = logging.getLogger(__name__)
 # Job date bounds are entered in Israel local time, matching the rest of the app
 # (daily limits, transfer stats).
 _IL_TZ = ZoneInfo("Asia/Jerusalem")
+
+# Sharding shape. The plan aims for a fixed number of chunks rather than a fixed
+# chunk size, so a 500-message channel and a 500,000-message one both end up with
+# enough chunks to keep every account busy without producing thousands of rows.
+_TARGET_CHUNKS = 200
+_MIN_CHUNK_IDS = 200
+# A chunk whose owner has been silent this long is assumed dead and handed back.
+# Generous on purpose — see job_chunk_repo.reclaim_stale.
+_CHUNK_STALE_S = 30 * 60
+# How long the leader waits between checks while other accounts finish their chunks.
+_LEADER_WAIT_S = 5
+
+
+@dataclass
+class _JobContext:
+    """Everything a copy pass needs that is resolved once per job, not per chunk."""
+    src_rec: object
+    dst_rec: object
+    src_entity: object
+    dst_entity: object
+    blocked_words: list[str]
+    skip_duplicates: bool
+    # Learned the first time a forward is refused, then honoured for the rest of
+    # the run so we don't retry a forward that can only fail.
+    src_is_protected: bool = False
+
+
+class _Progress:
+    """
+    A single pass's counters, flushed to the DB as deltas.
+
+    Deltas, not totals: a sharded job has several accounts copying different
+    chunks at the same time, and each one only knows its own tally. Writing
+    absolute counts would make every flush overwrite the other accounts' work.
+    """
+
+    def __init__(self, job_id: int, chunk_id: Optional[int]) -> None:
+        self._job_id = job_id
+        self._chunk_id = chunk_id
+        self.copied = 0
+        self.skipped = 0
+        self.failed = 0
+        self._flushed = (0, 0, 0)
+
+    def flush(self, checkpoint: int) -> None:
+        delta = (
+            self.copied - self._flushed[0],
+            self.skipped - self._flushed[1],
+            self.failed - self._flushed[2],
+        )
+        self._flushed = (self.copied, self.skipped, self.failed)
+        if self._chunk_id is None:
+            job_repo.add_progress(self._job_id, *delta, last_processed_id=checkpoint)
+        else:
+            # The job-wide checkpoint means nothing once several accounts are
+            # copying different parts of the range — the chunk carries its own.
+            job_repo.add_progress(self._job_id, *delta)
+            job_chunk_repo.checkpoint(self._chunk_id, checkpoint)
 
 
 class CopyEngine:
@@ -46,14 +117,164 @@ class CopyEngine:
         self._resolve_callback = resolve_callback
         self._userbot_id = userbot_id
 
+    # ── Entry points ───────────────────────────────────────────────────────────
+
     async def run_job(self, job: Job) -> None:
+        """
+        Run a job as its leader — the account that claimed it out of the queue.
+
+        With one eligible account this is the same single ordered pass it always
+        was. With two or more the job is sharded and this account works chunks
+        alongside the others, then closes the job once the last chunk is done.
+        """
+        ctx = await self._prepare(job)
+        if ctx is None:
+            return
+
+        job_repo.mark_started(job.id)
+
+        if not await self._plan_shards(job, ctx):
+            outcome = await self._copy_stream(job, ctx, chunk=None)
+            if outcome == "capped":
+                job_repo.release_job(job.id, "pending")
+            if outcome != "completed":
+                return
+            await self._finalize(job, ctx)
+            return
+
+        await self._lead_sharded(job, ctx)
+
+    async def run_chunk(self, job: Job, chunk: JobChunk) -> None:
+        """
+        Copy one chunk of a job that another account is leading.
+
+        Nothing here touches the job's status: the leader is still running and is
+        the only one allowed to decide the job is finished.
+        """
+        ctx = await self._prepare(job)
+        if ctx is None:
+            return
+        try:
+            outcome = await self._copy_stream(job, ctx, chunk=chunk)
+        except Exception:
+            job_chunk_repo.release(chunk.id, self._userbot_id)
+            raise
+        if outcome == "completed":
+            job_chunk_repo.mark_done(chunk.id, self._userbot_id)
+        else:
+            job_chunk_repo.release(chunk.id, self._userbot_id)
+
+    # ── Leading a sharded job ──────────────────────────────────────────────────
+
+    async def _lead_sharded(self, job: Job, ctx: _JobContext) -> None:
+        while True:
+            job_chunk_repo.reclaim_stale(job.id, _CHUNK_STALE_S)
+            chunk = job_chunk_repo.claim_next(job.id, self._userbot_id)
+
+            if chunk is not None:
+                try:
+                    outcome = await self._copy_stream(job, ctx, chunk=chunk)
+                except Exception:
+                    job_chunk_repo.release(chunk.id, self._userbot_id)
+                    raise
+                if outcome == "completed":
+                    job_chunk_repo.mark_done(chunk.id, self._userbot_id)
+                    continue
+                job_chunk_repo.release(chunk.id, self._userbot_id)
+                if outcome == "capped":
+                    # Out of quota for the day. Hand the whole job back so an
+                    # account with budget leads it — finished chunks stay done, so
+                    # nothing gets copied twice.
+                    job_repo.release_job(job.id, "pending")
+                return
+
+            left = job_chunk_repo.count_unfinished(job.id)
+            if left == 0:
+                break
+            if job_repo.should_stop(job.id):
+                return
+            logger.info(
+                "Job #%d: no free chunks — waiting for %d still with other account(s)",
+                job.id, left,
+            )
+            await asyncio.sleep(_LEADER_WAIT_S)
+
+        await self._finalize(job, ctx)
+
+    async def _plan_shards(self, job: Job, ctx: _JobContext) -> bool:
+        """
+        Split the job's remaining ID range into chunks. True once it is sharded.
+
+        Sharding needs at least two accounts known to reach both channels: with
+        one there is nothing to parallelise, and a single ascending pass is what
+        keeps the destination in source order. A job planned by an earlier run
+        stays sharded — its finished chunks are exactly the work not to redo.
+        """
+        if job_chunk_repo.count_for_job(job.id) > 0:
+            return True
+        if job.mode == "single_id":
+            return False
+
+        eligible = self._eligible_accounts(job)
+        if len(eligible) < 2:
+            return False
+
+        bounds = await self._shard_bounds(job, ctx)
+        if bounds is None:
+            return False
+        lo, hi = bounds
+
+        size = max(_MIN_CHUNK_IDS, math.ceil((hi - lo + 1) / _TARGET_CHUNKS))
+        ranges = [(start, min(start + size - 1, hi)) for start in range(lo, hi + 1, size)]
+        if len(ranges) < 2:
+            return False  # too small to be worth splitting
+
+        job_chunk_repo.plan(job.id, ranges)
+        logger.info(
+            "Job #%d: %d accounts can reach both channels — sharded ids %d–%d into "
+            "%d chunk(s) of ~%d ids each",
+            job.id, len(eligible), lo, hi, len(ranges), size,
+        )
+        return True
+
+    def _eligible_accounts(self, job: Job) -> set[int]:
+        """Active accounts that can actually run this job, right now."""
+        from app.repositories import channel_access_repo, userbot_repo
+
+        active = {u.id for u in userbot_repo.get_active()}
+        with_access = channel_access_repo.active_with_access(job.source_id, job.destination_id)
+        # This account resolved both channels a moment ago, so it plainly has
+        # access even if its own probe hasn't been recorded yet.
+        if self._userbot_id is not None:
+            with_access.add(self._userbot_id)
+        return (active & with_access) - job.excluded_ids()
+
+    async def _shard_bounds(self, job: Job, ctx: _JobContext) -> Optional[tuple[int, int]]:
+        """The lowest and highest source message ID this job still has to cover."""
+        resume_from = (job.last_processed_id or 0) + 1
+        if job.mode == "id_range":
+            lo = max(job.id_from or 1, resume_from)
+            hi = job.id_to or 0
+        else:
+            # 'all' and 'date_range' are both bounded by the channel itself. The
+            # date filter stays inside the copy loop, so a chunk that falls outside
+            # the requested dates simply yields nothing.
+            lo = max(1, resume_from)
+            msgs = await self._client.get_messages(ctx.src_entity, limit=1)
+            hi = msgs[0].id if msgs else 0
+        if hi <= lo:
+            return None
+        return lo, hi
+
+    # ── Shared setup / teardown ────────────────────────────────────────────────
+
+    async def _prepare(self, job: Job) -> Optional[_JobContext]:
+        """Resolve settings, filters and both channel entities. None if the job can't run."""
         from app.repositories import state_repo
+
         settings = state_repo.get_settings_dict()
         self._rate_limiter.update_from_settings(settings)
-        group_media: bool = job.group_media
-        skip_duplicates: bool = settings.get("skip_duplicates", "0") == "1"
 
-        # Snapshot blocked words once at job start
         blocked_words: list[str] = []
         if job.use_blocked_words:
             blocked_words = filter_repo.get_word_strings()
@@ -63,7 +284,7 @@ class CopyEngine:
         dst_rec = source_repo.get_destination_by_id(job.destination_id)
         if not src_rec or not dst_rec:
             job_repo.update_status(job.id, "failed", error="מקור או יעד לא נמצאו")
-            return
+            return None
 
         try:
             from app.worker.telegram_utils import get_entity_safe
@@ -103,22 +324,92 @@ class CopyEngine:
             except Exception:  # nosec B110 — best-effort cache update, non-fatal
                 pass
 
-        # Build dedup set from DB
-        already_done: set[int] = job_repo.get_copied_source_ids(job.id)
-        logger.info(
-            "Job #%d: resuming — %d already done, checkpoint=#%s",
-            job.id, len(already_done), job.last_processed_id,
+        return _JobContext(
+            src_rec=src_rec,
+            dst_rec=dst_rec,
+            src_entity=src_entity,
+            dst_entity=dst_entity,
+            blocked_words=blocked_words,
+            skip_duplicates=settings.get("skip_duplicates", "0") == "1",
         )
 
-        # Detected once per job: if True, skip ForwardMessagesRequest entirely
-        src_is_protected: bool = False
+    async def _finalize(self, job: Job, ctx: _JobContext) -> None:
+        """Close a job out: terminal status plus the Telegraph report."""
+        # The source can run out at the same moment the user cancels. Never write a
+        # terminal state over 'cancelled' — that silently undid the cancel and left
+        # the job looking like it had completed normally.
+        if job_repo.should_stop(job.id):
+            logger.info("Job #%d: stopped by user at end of run", job.id)
+            return
 
-        job_repo.mark_started(job.id)
+        fresh = job_repo.get_by_id(job.id) or job
+        if job.continuous:
+            # A continuous job doesn't finish — it graduates from copying history
+            # to listening for new messages. The worker picks it up as a listener
+            # on its next reconcile.
+            job_repo.mark_backfill_done(job.id)
+            logger.info(
+                "Job #%d: history copy finished (copied=%d skipped=%d failed=%d) "
+                "— switching to live listening",
+                job.id, fresh.copied_count, fresh.skipped_count, fresh.failed_count,
+            )
+        else:
+            job_repo.mark_completed(job.id)
+            logger.info(
+                "Job #%d completed: copied=%d skipped=%d failed=%d",
+                job.id, fresh.copied_count, fresh.skipped_count, fresh.failed_count,
+            )
 
-        copied = job.copied_count
-        skipped = job.skipped_count
-        failed = job.failed_count
-        _last_progress_log = copied
+        # Generate Telegraph report for notable (failed / unexpected-skipped) messages
+        report_msgs = job_repo.get_report_messages(job.id)
+        if not report_msgs:
+            logger.info("Job #%d: no notable messages — Telegraph report skipped", job.id)
+            return
+        from app.services import telegraph_service
+        url = await telegraph_service.create_report(
+            job.id, report_msgs, ctx.src_rec.resolved_id, ctx.src_rec.channel_ref
+        )
+        if url:
+            job_repo.save_report_url(job.id, url)
+            logger.info("Job #%d Telegraph report: %s", job.id, url)
+
+    # ── One copy pass ──────────────────────────────────────────────────────────
+
+    async def _copy_stream(
+        self, job: Job, ctx: _JobContext, chunk: Optional[JobChunk] = None
+    ) -> str:
+        """
+        Copy one range of the job — the whole of it, or a single chunk.
+
+        Returns:
+          "completed" — the range was copied to the end
+          "stopped"   — the user paused or cancelled the job
+          "capped"    — this account ran out of daily quota part-way
+        """
+        group_media: bool = job.group_media
+        skip_duplicates: bool = ctx.skip_duplicates
+        blocked_words: list[str] = ctx.blocked_words
+        src_entity = ctx.src_entity
+        dst_entity = ctx.dst_entity
+
+        # Only this range's history is relevant; loading a big job's whole record
+        # for every chunk would be waste.
+        if chunk is None:
+            already_done: set[int] = job_repo.get_copied_source_ids(job.id)
+            logger.info(
+                "Job #%d: resuming — %d already done, checkpoint=#%s",
+                job.id, len(already_done), job.last_processed_id,
+            )
+        else:
+            already_done = job_repo.get_copied_source_ids(job.id, chunk.id_from, chunk.id_to)
+            logger.info(
+                "Job #%d chunk #%d (ids %d–%d): %d already done, checkpoint=#%s",
+                job.id, chunk.id, chunk.id_from, chunk.id_to,
+                len(already_done), chunk.last_processed_id,
+            )
+
+        p = _Progress(job.id, chunk.id if chunk else None)
+        _last_progress_log = 0
         _msgs_since_pause_check = 0  # check for pause every 25 messages
         _msgs_since_limit_check = 0  # check daily limit every 100 messages
 
@@ -131,7 +422,7 @@ class CopyEngine:
 
         async def flush_solo_media() -> bool:
             """Flush solo media buffer. Returns True if the job must stop (paused/cancelled)."""
-            nonlocal copied, skipped, failed, solo_media_buffer, src_is_protected
+            nonlocal solo_media_buffer
             if not solo_media_buffer:
                 return False
             # Check before sending, not only after: otherwise a cancel still lets
@@ -152,36 +443,35 @@ class CopyEngine:
                 if not job.copy_text and (not m.media or isinstance(m.media, MessageMediaUnsupported)):
                     job_repo.record_copied_message(job.id, m.id, None, "skipped", "text_stripped_empty", userbot_id=self._userbot_id)
                     already_done.add(m.id)
-                    skipped += 1
+                    p.skipped += 1
                     continue
                 if blocked_words and self._is_blocked(m, blocked_words):
                     job_repo.record_copied_message(job.id, m.id, None, "skipped", "blocked_word", userbot_id=self._userbot_id)
                     already_done.add(m.id)
-                    skipped += 1
+                    p.skipped += 1
                     continue
                 if allowed_types != ALL_CONTENT_TYPES:
                     msg_type = self._get_content_type(m)
                     if msg_type not in allowed_types:
                         job_repo.record_copied_message(job.id, m.id, None, "skipped", f"content_type:{msg_type}", userbot_id=self._userbot_id)
                         already_done.add(m.id)
-                        skipped += 1
+                        p.skipped += 1
                         continue
                 if skip_duplicates and dedup_repo.is_duplicate(m, job.destination_id):
                     job_repo.record_copied_message(job.id, m.id, None, "skipped", "duplicate", userbot_id=self._userbot_id)
                     already_done.add(m.id)
-                    skipped += 1
+                    p.skipped += 1
                     continue
                 to_send.append(m)
 
             if not to_send:
-                job_repo.update_progress(job.id, copied, skipped, failed, checkpoint)
+                p.flush(checkpoint)
                 return False
 
             async def _send_single(m: Message) -> tuple[str, str | None]:
-                """Forward one message; returns (status, reason). Updates src_is_protected."""
-                nonlocal src_is_protected
+                """Forward one message; returns (status, reason). Updates ctx.src_is_protected."""
                 try:
-                    if src_is_protected:
+                    if ctx.src_is_protected:
                         await self._send_as_copy(m, dst_entity, copy_text=job.copy_text)
                     else:
                         if job.copy_text:
@@ -196,7 +486,7 @@ class CopyEngine:
                             await self._client.send_file(dst_entity, m.media, caption="")
                     return "copied", None
                 except ChatForwardsRestrictedError:
-                    src_is_protected = True
+                    ctx.src_is_protected = True
                     try:
                         await self._send_as_copy(m, dst_entity, copy_text=job.copy_text)
                         return "copied", None
@@ -212,10 +502,10 @@ class CopyEngine:
             if len(to_send) == 1:
                 st, reason = await _send_single(to_send[0])
                 if st == "copied":
-                    copied += 1
+                    p.copied += 1
                     self._record_transfer(job, to_send[0])
                 else:
-                    failed += 1
+                    p.failed += 1
                 job_repo.record_copied_message(job.id, to_send[0].id, None, st, reason, userbot_id=self._userbot_id)
                 already_done.add(to_send[0].id)
             else:
@@ -241,17 +531,17 @@ class CopyEngine:
                         job_repo.record_copied_message(job.id, m.id, None, "copied", None, userbot_id=self._userbot_id)
                         self._record_transfer(job, m)
                         already_done.add(m.id)
-                        copied += 1
+                        p.copied += 1
                 else:
                     # Send only the first message individually (it's the one causing the issue),
                     # then put the rest back into the buffer so they can form a new album.
                     first = to_send[0]
                     st, reason = await _send_single(first)
                     if st == "copied":
-                        copied += 1
+                        p.copied += 1
                         self._record_transfer(job, first)
                     else:
-                        failed += 1
+                        p.failed += 1
                         logger.warning(
                             "Job #%d: failed to send msg #%d individually: %s",
                             job.id, first.id, reason,
@@ -275,7 +565,7 @@ class CopyEngine:
                         # re-queued id is above the one just sent.
                         checkpoint = first.id
 
-            job_repo.update_progress(job.id, copied, skipped, failed, checkpoint)
+            p.flush(checkpoint)
             if job_repo.should_stop(job.id):
                 logger.info("Job #%d: stop requested (paused/cancelled) after media flush at #%d", job.id, checkpoint)
                 return True
@@ -284,7 +574,7 @@ class CopyEngine:
 
         async def flush_group() -> bool:
             """Flush pending album group. Returns True if the job must stop (paused/cancelled)."""
-            nonlocal copied, skipped, failed, pending_group, current_group_id, src_is_protected
+            nonlocal pending_group, current_group_id
             if not pending_group:
                 return False
             if job_repo.should_stop(job.id):
@@ -301,8 +591,8 @@ class CopyEngine:
             if not pending:
                 return False
 
-            statuses, src_is_protected = await self._process_group(
-                job, pending, blocked_words, src_entity, dst_entity, src_is_protected,
+            statuses, ctx.src_is_protected = await self._process_group(
+                job, pending, blocked_words, src_entity, dst_entity, ctx.src_is_protected,
                 skip_duplicates=skip_duplicates,
             )
 
@@ -320,14 +610,14 @@ class CopyEngine:
                 )
                 already_done.add(msg.id)
                 if status == "copied":
-                    copied += 1
+                    p.copied += 1
                     self._record_transfer(job, msg)
                 elif status == "skipped":
-                    skipped += 1
+                    p.skipped += 1
                 else:
-                    failed += 1
+                    p.failed += 1
 
-            job_repo.update_progress(job.id, copied, skipped, failed, last_id)
+            p.flush(last_id)
             if job_repo.should_stop(job.id):
                 logger.info("Job #%d: stop requested (paused/cancelled) after album flush at #%d", job.id, last_id)
                 return True
@@ -335,7 +625,7 @@ class CopyEngine:
             return False
 
         try:
-            async for msg in self._fetch_messages(job, src_entity):
+            async for msg in self._fetch_messages(job, src_entity, chunk):
                 if msg is None or not hasattr(msg, "id"):
                     continue
 
@@ -343,18 +633,18 @@ class CopyEngine:
                     # Existing album: flush solo buffer first, then accumulate
                     if group_media:
                         if await flush_solo_media():
-                            return
+                            return "stopped"
                     if msg.grouped_id == current_group_id:
                         pending_group.append(msg)
                     else:
                         if await flush_group():
-                            return
+                            return "stopped"
                         current_group_id = msg.grouped_id
                         pending_group = [msg]
                 else:
                     # Individual message: flush any pending album group first
                     if await flush_group():
-                        return
+                        return "stopped"
 
                     if group_media and self._is_groupable(msg):
                         # Add to solo buffer (skip if already done)
@@ -362,18 +652,18 @@ class CopyEngine:
                             solo_media_buffer.append(msg)
                         if len(solo_media_buffer) >= 10:
                             if await flush_solo_media():
-                                return
+                                return "stopped"
                     else:
                         # Non-groupable: flush solo buffer, then process normally
                         if group_media:
                             if await flush_solo_media():
-                                return
+                                return "stopped"
 
                         if msg.id in already_done:
                             continue
 
-                        status, skip_reason, src_is_protected = await self._process_message(
-                            job, msg, blocked_words, src_entity, dst_entity, src_is_protected,
+                        status, skip_reason, ctx.src_is_protected = await self._process_message(
+                            job, msg, blocked_words, src_entity, dst_entity, ctx.src_is_protected,
                             skip_duplicates=skip_duplicates,
                         )
 
@@ -388,19 +678,19 @@ class CopyEngine:
                         already_done.add(msg.id)
 
                         if status == "copied":
-                            copied += 1
+                            p.copied += 1
                             self._record_transfer(job, msg)
                         elif status == "skipped":
-                            skipped += 1
+                            p.skipped += 1
                         else:
-                            failed += 1
+                            p.failed += 1
 
-                        job_repo.update_progress(job.id, copied, skipped, failed, msg.id)
-                        if copied - _last_progress_log >= 50:
-                            _last_progress_log = copied
+                        p.flush(msg.id)
+                        if p.copied - _last_progress_log >= 50:
+                            _last_progress_log = p.copied
                             logger.info(
                                 "Job #%d progress: copied=%d skipped=%d failed=%d last_id=#%d",
-                                job.id, copied, skipped, failed, msg.id,
+                                job.id, p.copied, p.skipped, p.failed, msg.id,
                             )
                         # Checked every message, not every 25: it is one indexed
                         # primary-key lookup, which is nothing next to the 2–5s
@@ -408,8 +698,7 @@ class CopyEngine:
                         # take effect on the next message instead of 25 later.
                         if job_repo.should_stop(job.id):
                             logger.info("Job #%d: stop requested (paused/cancelled) — stopping at msg #%d", job.id, msg.id)
-                            job_repo.update_progress(job.id, copied, skipped, failed, msg.id)
-                            return
+                            return "stopped"
 
                         _msgs_since_pause_check += 1
                         if _msgs_since_pause_check >= 25:
@@ -421,44 +710,41 @@ class CopyEngine:
                         if _msgs_since_limit_check >= 100 and self._userbot_id is not None:
                             _msgs_since_limit_check = 0
                             from app.ui.texts import DAILY_LIMIT
-                            # The cap belongs to this account, not to the job: hand
-                            # the job back so an account with budget resumes it from
-                            # the checkpoint (copied_messages stops any re-copying).
-                            # This runner stops claiming until midnight, so it cannot
-                            # take the job straight back. Only when every account is
-                            # capped does the job wait — park_queue_if_all_capped.
+                            # The cap belongs to this account, not to the job or the
+                            # chunk: hand the work back so an account with budget
+                            # resumes it from the checkpoint (copied_messages stops
+                            # any re-copying). This runner stops claiming until
+                            # midnight, so it cannot take it straight back. Only when
+                            # every account is capped does the queue wait — see
+                            # park_queue_if_all_capped.
                             count_today = job_repo.get_daily_count_for_userbot(self._userbot_id)
                             if count_today >= DAILY_LIMIT:
                                 logger.warning(
-                                    "Job #%d: userbot #%d hit its daily limit mid-job (%d msgs) — "
+                                    "Job #%d: userbot #%d hit its daily limit mid-run (%d msgs) — "
                                     "releasing at msg #%d for another account",
                                     job.id, self._userbot_id, count_today, msg.id,
                                 )
-                                job_repo.update_progress(job.id, copied, skipped, failed, msg.id)
-                                job_repo.release_job(job.id, "pending")
-                                return
+                                return "capped"
 
                         await self._rate_limiter.wait()
 
             # Flush any remaining buffers at end of stream
             if await flush_group():
-                return
+                return "stopped"
             if group_media:
                 while solo_media_buffer:
                     if await flush_solo_media():
-                        return
+                        return "stopped"
 
         except FloodWaitError:
             logger.warning("Job #%d: FloodWait encountered", job.id)
-            job_repo.update_progress(job.id, copied, skipped, failed, job.last_processed_id or 0)
             raise
 
         except (ChatWriteForbiddenError, ChannelPrivateError) as e:
-            # Access lost mid-job. Progress is checkpointed, so another userbot
-            # can pick this job up and resume from where this one stopped.
-            job_repo.update_progress(job.id, copied, skipped, failed, job.last_processed_id or 0)
+            # Access lost mid-run. Progress is checkpointed, so another userbot
+            # can pick this up and resume from where this one stopped.
             logger.warning(
-                "Job #%d: userbot %s lost access mid-job (%s) — requesting reassignment",
+                "Job #%d: userbot %s lost access mid-run (%s) — requesting reassignment",
                 job.id, self._userbot_id, e,
             )
             raise NoAccessError(f"אין הרשאת גישה/כתיבה לערוץ: {e}") from e
@@ -467,53 +753,21 @@ class CopyEngine:
             logger.exception("Job #%d: unexpected error: %s", job.id, e)
             raise
 
-        # The source can run out at the same moment the user cancels. Never write a
-        # terminal state over 'cancelled' — that silently undid the cancel and left
-        # the job looking like it had completed normally.
-        if job_repo.should_stop(job.id):
-            logger.info(
-                "Job #%d: stopped by user at end of run (copied=%d skipped=%d failed=%d)",
-                job.id, copied, skipped, failed,
-            )
-            return
-
-        if job.continuous:
-            # A continuous job doesn't finish — it graduates from copying history
-            # to listening for new messages. The worker picks it up as a listener
-            # on its next reconcile.
-            job_repo.mark_backfill_done(job.id)
-            logger.info(
-                "Job #%d: history copy finished (copied=%d skipped=%d failed=%d) "
-                "— switching to live listening",
-                job.id, copied, skipped, failed,
-            )
-        else:
-            job_repo.mark_completed(job.id)
-            logger.info(
-                "Job #%d completed: copied=%d skipped=%d failed=%d",
-                job.id, copied, skipped, failed,
-            )
-
-        # Generate Telegraph report for notable (failed / unexpected-skipped) messages
-        report_msgs = job_repo.get_report_messages(job.id)
-        if not report_msgs:
-            logger.info("Job #%d: no notable messages — Telegraph report skipped", job.id)
-        if report_msgs:
-            from app.services import telegraph_service
-            url = await telegraph_service.create_report(
-                job.id, report_msgs, src_rec.resolved_id, src_rec.channel_ref
-            )
-            if url:
-                job_repo.save_report_url(job.id, url)
-                logger.info("Job #%d Telegraph report: %s", job.id, url)
+        return "completed"
 
     # ── Message fetching ───────────────────────────────────────────────────────
 
     async def _fetch_messages(
-        self, job: Job, src_entity
+        self, job: Job, src_entity, chunk: Optional[JobChunk] = None
     ) -> AsyncIterator[Message]:
         """Yield messages in ascending ID order (oldest first) for safe resume."""
         client = self._client
+
+        if chunk is not None:
+            async for msg in self._fetch_chunk_messages(job, src_entity, chunk):
+                yield msg
+            return
+
         min_id = job.last_processed_id or 0
 
         if job.mode == "all":
@@ -551,6 +805,38 @@ class CopyEngine:
                 msg = await client.get_messages(src_entity, ids=job.single_message_id)
                 if msg:
                     yield msg
+
+    async def _fetch_chunk_messages(
+        self, job: Job, src_entity, chunk: JobChunk
+    ) -> AsyncIterator[Message]:
+        """
+        Yield one chunk's messages, ascending.
+
+        The bounds are the chunk's, and so is the checkpoint: the job-wide one is
+        meaningless while other accounts are copying other parts of the range.
+        'id_range' needs no extra filtering because the chunk plan is already cut
+        from that range; 'date_range' still filters here, since its chunks are cut
+        from the channel's whole ID span.
+        """
+        client = self._client
+        min_id = max(chunk.id_from - 1, chunk.last_processed_id or 0)
+        max_id = chunk.id_to + 1
+
+        date_from = _parse_date(job.date_from) if job.mode == "date_range" else None
+        date_to = _parse_date(job.date_to) if job.mode == "date_range" else None
+
+        async for msg in client.iter_messages(
+            src_entity, reverse=True, min_id=min_id, max_id=max_id
+        ):
+            if date_from or date_to:
+                if not msg.date:
+                    continue
+                msg_date = _as_aware_utc(msg.date)
+                if date_from and msg_date < date_from:
+                    continue
+                if date_to and msg_date > date_to:
+                    break
+            yield msg
 
     # ── Message processing ─────────────────────────────────────────────────────
 
@@ -814,11 +1100,13 @@ class CopyEngine:
 
         job_repo.record_copied_message(job.id, msg.id, None, status, skip_reason, userbot_id=self._userbot_id)
 
-        fresh = job_repo.get_by_id(job.id) or job
-        copied = fresh.copied_count + (1 if status == "copied" else 0)
-        skipped = fresh.skipped_count + (1 if status == "skipped" else 0)
-        failed = fresh.failed_count + (1 if status == "failed" else 0)
-        job_repo.update_progress(job.id, copied, skipped, failed, msg.id)
+        job_repo.add_progress(
+            job.id,
+            copied=1 if status == "copied" else 0,
+            skipped=1 if status == "skipped" else 0,
+            failed=1 if status == "failed" else 0,
+            last_processed_id=msg.id,
+        )
 
         if status == "copied":
             self._record_transfer(job, msg)

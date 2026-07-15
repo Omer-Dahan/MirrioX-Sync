@@ -79,6 +79,24 @@ CREATE TABLE IF NOT EXISTS jobs (
     error_message     TEXT
 );
 
+-- One slice of a job's source ID range, so several userbot accounts can copy the
+-- same job at once. Rows exist only for jobs that were actually sharded: with a
+-- single eligible account the job stays one ordered pass and this table is empty
+-- for it.
+CREATE TABLE IF NOT EXISTS job_chunks (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id              INTEGER NOT NULL,
+    id_from             INTEGER NOT NULL,
+    id_to               INTEGER NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','running','done')),
+    assigned_userbot_id INTEGER,
+    last_processed_id   INTEGER,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(job_id, id_from)
+);
+
 CREATE TABLE IF NOT EXISTS copied_messages (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id            INTEGER NOT NULL,
@@ -195,6 +213,7 @@ CREATE TABLE IF NOT EXISTS transferred_registry (
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status        ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_job_chunks_job     ON job_chunks(job_id, status);
 CREATE INDEX IF NOT EXISTS idx_copied_msg_job     ON copied_messages(job_id);
 CREATE INDEX IF NOT EXISTS idx_copied_src_id      ON copied_messages(job_id, source_message_id);
 CREATE INDEX IF NOT EXISTS idx_scan_items_media   ON duplicate_scan_items(scan_id, media_id);

@@ -242,6 +242,41 @@ class Job:
 
 
 @dataclass
+class JobChunk:
+    """
+    One slice of a job's source ID range, claimable by a single account.
+
+    Chunks are how a job runs on more than one userbot: each account claims a
+    chunk of its own, so no two accounts ever touch the same message. A chunk
+    carries its own checkpoint, so an account that drops out mid-chunk hands back
+    only the part it hadn't reached.
+    """
+    id: int
+    job_id: int
+    id_from: int
+    id_to: int
+    status: str  # pending | running | done
+    assigned_userbot_id: Optional[int]
+    last_processed_id: Optional[int]
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "JobChunk":
+        return cls(
+            id=row["id"],
+            job_id=row["job_id"],
+            id_from=row["id_from"],
+            id_to=row["id_to"],
+            status=row["status"],
+            assigned_userbot_id=row["assigned_userbot_id"],
+            last_processed_id=row["last_processed_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass
 class CopiedMessage:
     id: int
     job_id: int

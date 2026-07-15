@@ -361,12 +361,7 @@ def job_detail_text(
 
     queue_line = f"\nמיקום בתור: #{queue_position}" if queue_position else ""
 
-    runner_line = ""
-    if job.assigned_userbot_id:
-        from app.repositories import userbot_repo
-        ub = userbot_repo.get_by_id(job.assigned_userbot_id)
-        if ub:
-            runner_line = f"\n🤖 מבוצע ע\"י: {esc(ub.display())}"
+    runner_line = _render_runners(job)
 
     retry_info = ""
     if job.status == "waiting_retry":
@@ -426,6 +421,39 @@ def job_detail_text(
 
 
 # ── Job creation wizard ────────────────────────────────────────────────────────
+
+def _render_runners(job: "Job") -> str:
+    """
+    Which account(s) are on this job, and how far a parallel run has got.
+
+    A sharded job has no single owner: the leader in assigned_userbot_id is just
+    the account that claimed it out of the queue, while any number of others may
+    be working chunks of it right now. Reading the accounts off the chunks is the
+    only way to show who is actually copying.
+    """
+    from app.repositories import job_chunk_repo, userbot_repo
+
+    done, total = job_chunk_repo.progress(job.id)
+    if total == 0:
+        if not job.assigned_userbot_id:
+            return ""
+        ub = userbot_repo.get_by_id(job.assigned_userbot_id)
+        return f"\n🤖 מבוצע ע\"י: {esc(ub.display())}" if ub else ""
+
+    working_ids = set(job_chunk_repo.active_userbot_ids(job.id))
+    if job.assigned_userbot_id:
+        working_ids.add(job.assigned_userbot_id)
+    names = [
+        esc(ub.display())
+        for ub in (userbot_repo.get_by_id(i) for i in sorted(working_ids))
+        if ub
+    ]
+    who = ", ".join(names) if names else "—"
+    line = f"\n🤖 מבוצע ע\"י: {who}"
+    if len(names) > 1:
+        line += f" <b>(מקבילי ×{len(names)})</b>"
+    return line + f"\n🧩 בלוקים: {done:,}/{total:,}"
+
 
 def wizard_header(step: int, total: int, partial: dict) -> str:
     lines = [f"<b>שלב {step}/{total}</b>"]

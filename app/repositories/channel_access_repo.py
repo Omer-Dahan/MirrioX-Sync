@@ -90,6 +90,31 @@ def any_active_has_access(channel_kind: str, channel_id: int) -> bool:
     return row is not None
 
 
+def active_with_access(source_id: int, destination_id: int) -> set[int]:
+    """
+    Active accounts proven to reach *both* channels of a job.
+
+    This is what decides whether a job is worth splitting across accounts. Unlike
+    the claim rules — which treat an unprobed channel as claimable so a lagging
+    check can't stall the queue — this test is positive on purpose: sharding a job
+    onto an account that turns out to have no access only costs a reassignment,
+    and running unsharded is always correct.
+    """
+    conn = db.get_connection()
+    rows = conn.execute(
+        """SELECT u.id AS userbot_id FROM userbots u
+            WHERE u.status = 'active'
+              AND EXISTS (SELECT 1 FROM channel_access ca
+                           WHERE ca.userbot_id = u.id AND ca.has_access = 1
+                             AND ca.channel_kind = 'source' AND ca.channel_id = ?)
+              AND EXISTS (SELECT 1 FROM channel_access ca
+                           WHERE ca.userbot_id = u.id AND ca.has_access = 1
+                             AND ca.channel_kind = 'destination' AND ca.channel_id = ?)""",
+        (source_id, destination_id),
+    ).fetchall()
+    return {r["userbot_id"] for r in rows}
+
+
 def pending_active_checks(channel_kind: str, channel_id: int) -> int:
     """How many active accounts still have to probe this channel."""
     conn = db.get_connection()

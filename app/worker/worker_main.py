@@ -172,7 +172,9 @@ def _startup_recovery() -> None:
     4. clean shutdown (idle/stopped) — just log and continue.
 
     5. Any userbot assignment from the previous run is stale — clear them all so
-       jobs can be claimed fresh by whichever accounts come up this time.
+       jobs can be claimed fresh by whichever accounts come up this time. The same
+       goes for job chunks: nobody holds one across a restart, and each keeps its
+       own checkpoint, so a re-claimed chunk resumes instead of restarting.
     """
     logger.info("Running startup recovery...")
     ws = state_repo.get_worker_state()
@@ -181,6 +183,11 @@ def _startup_recovery() -> None:
     cleared = job_repo.clear_all_assignments()
     if cleared:
         logger.info("Recovery: cleared %d stale userbot assignment(s)", cleared)
+
+    from app.repositories import job_chunk_repo
+    chunks = job_chunk_repo.release_all_running()
+    if chunks:
+        logger.info("Recovery: released %d job chunk(s) held at shutdown", chunks)
 
     if ws.status == "running" and ws.current_job_id:
         job = job_repo.get_by_id(ws.current_job_id)

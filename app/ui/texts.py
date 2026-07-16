@@ -104,6 +104,10 @@ BTN_ADD             = "➕ הוסף"
 BTN_SUBMIT_JOB      = "▶️ הגש להרצה"
 BTN_PAUSE_JOB       = "⏸ השהה משימה"
 BTN_RESUME_JOB      = "▶️ המשך משימה"
+BTN_EDIT_JOB        = "✏️ ערוך משימה"
+BTN_EDIT_CONTENT_TYPES = "📁 סוגי תוכן"
+BTN_RESET_EXCLUSIONS = "🔄 אפס חסימות גישה"
+BTN_EDIT_ACCOUNTS   = "🤖 חשבונות מריצים"
 BTN_CANCEL_JOB      = "⏹ בטל משימה"
 BTN_DELETE_JOB      = "🗑 מחק משימה"
 BTN_YES_DELETE      = "✅ כן, מחק"
@@ -119,6 +123,8 @@ BTN_CONTINUOUS_ON     = "🔄 סנכרון רציף: כן"
 BTN_CONTINUOUS_OFF    = "⏹ סנכרון רציף: לא"
 BTN_STOP_LISTENING    = "⏸ עצור האזנה"
 BTN_START_LISTENING   = "🟢 הפעל האזנה"
+BTN_WZD_ALL_ACCOUNTS  = "🤖 כל החשבונות"
+BTN_WZD_ACCOUNTS_DONE = "✔ חזור לסיכום"
 BTN_SAVE_DRAFT      = "💾 שמור כטיוטה"
 BTN_TRANSFER_STATS  = "📊 סטטיסטיקות העברות"
 BTN_SCAN_DUPES      = "🔍 סרוק כפילויות"
@@ -133,6 +139,7 @@ TITLE_MAIN_MENU       = "🏠 <b>מיריוקס — לוח בקרה</b>"
 TITLE_JOBS            = "📂 <b>משימות</b>"
 TITLE_JOB_DETAIL      = "📋 <b>פרטי משימה</b>"
 TITLE_NEW_JOB         = "➕ <b>משימה חדשה</b>"
+TITLE_EDIT_JOB        = "✏️ <b>עריכת משימה</b>"
 TITLE_SOURCES         = "📡 <b>ערוצי מקור</b>"
 TITLE_SOURCE_DETAIL   = "📡 <b>פרטי מקור</b>"
 TITLE_DESTINATIONS    = "📤 <b>ערוצי יעד</b>"
@@ -361,6 +368,8 @@ def job_detail_text(
 
     queue_line = f"\nמיקום בתור: #{queue_position}" if queue_position else ""
 
+    allowed_line = _job_allowed_line(job)
+
     runner_line = _render_runners(job)
 
     retry_info = ""
@@ -402,6 +411,7 @@ def job_detail_text(
         f"מצב: {mode_label}{params_line}\n"
         f"תוכן: {ct_str}\n"
         f"סינון מילים: {filter_str}\n"
+        f"{allowed_line}"
         f"סטטוס: {status_label}{queue_line}{runner_line}{eta_str}"
         f"\n"
         f"\nתוצאות:\n"
@@ -421,6 +431,23 @@ def job_detail_text(
 
 
 # ── Job creation wizard ────────────────────────────────────────────────────────
+
+def _job_allowed_line(job: "Job") -> str:
+    """A 'restricted to accounts X, Y' line, or '' when the job runs on all."""
+    allowed = job.allowed_ids()
+    if not allowed:
+        return ""
+    from app.repositories import userbot_repo
+
+    names = [
+        esc(ub.display())
+        for ub in (userbot_repo.get_by_id(i) for i in sorted(allowed))
+        if ub
+    ]
+    if not names:
+        return ""
+    return f"חשבונות מריצים: {', '.join(names)}\n"
+
 
 def _render_runners(job: "Job") -> str:
     """
@@ -483,9 +510,39 @@ WIZARD_ENTER_ID_FROM = "הזן מזהה הודעה ראשונה (מספר):"
 WIZARD_ENTER_ID_TO = "הזן מזהה הודעה אחרונה (מספר):"
 WIZARD_ENTER_SINGLE_ID = "הזן מזהה ההודעה:"
 WIZARD_FILTER_AND_CONFIRM = "בדוק את הפרטים ואשר:"
+WIZARD_SELECT_ACCOUNTS = (
+    "בחר אילו חשבונות יריצו את המשימה:\n"
+    "<i>סמן ✅ עבור החשבונות המורשים. אם כולם מסומנים — המשימה תרוץ על כל "
+    "החשבונות הפעילים (ברירת מחדל). בחירת חשבון אחד תצמיד את המשימה אליו בלבד.</i>"
+)
 
 NO_SOURCES_YET = "לא הוגדרו מקורות עדיין. הוסף מקור תחילה."
 NO_DESTINATIONS_YET = "לא הוגדרו יעדים עדיין. הוסף יעד תחילה."
+
+
+def _wizard_allowed_names(partial: dict) -> "list[str] | None":
+    """
+    Names of the accounts allowed to run the job, or None when unrestricted.
+
+    'Unrestricted' covers both the untouched default and the case where every
+    active account is still selected — either way the job runs on all of them.
+    """
+    from app.repositories import userbot_repo
+
+    active = userbot_repo.get_active()
+    active_ids = {u.id for u in active}
+    selected = partial.get("allowed_ubs")
+    if not selected or set(selected) >= active_ids:
+        return None
+    return [u.display() for u in active if u.id in selected]
+
+
+def wizard_accounts_label(partial: dict) -> str:
+    """Short label for the summary-screen accounts button."""
+    names = _wizard_allowed_names(partial)
+    if names is None:
+        return "🤖 חשבונות: כל החשבונות"
+    return f"🤖 חשבונות: {len(names)} נבחרו"
 
 
 def wizard_summary_text(partial: dict, word_count: int) -> str:
@@ -524,6 +581,9 @@ def wizard_summary_text(partial: dict, word_count: int) -> str:
     else:
         src_str = "?"
 
+    allowed_names = _wizard_allowed_names(partial)
+    accounts_str = "כל החשבונות" if allowed_names is None else ", ".join(esc(n) for n in allowed_names)
+
     mode_line = f"🔧 מצב: {mode_label}{params}\n"
     if continuous:
         mode_line += (
@@ -542,9 +602,75 @@ def wizard_summary_text(partial: dict, word_count: int) -> str:
         f"📁 סוגי תוכן: {content_types_str}\n"
         f"🚫 סינון מילים: {filter_status}\n"
         f"📦 שליחה במרוכז: {group_status}\n"
-        f"📝 העתקת טקסט: {text_status}\n\n"
+        f"📝 העתקת טקסט: {text_status}\n"
+        f"🤖 חשבונות מריצים: {accounts_str}\n\n"
         f"אשר כדי לשמור כטיוטה."
     )
+
+
+def _content_types_display(content_types: str) -> str:
+    """Human-readable, ordered list of content-type labels for a job."""
+    parts = [p.strip() for p in (content_types or DEFAULT_CONTENT_TYPES).split(",") if p.strip()]
+    ct_map = {"image": "🖼 תמונות", "video": "🎬 סרטונים", "file": "📎 קבצים", "text": "💬 טקסט"}
+    labels = [ct_map[p] for p in ("image", "video", "file", "text") if p in parts]
+    return ", ".join(labels) or "—"
+
+
+def job_edit_text(job: "Job", word_count: int, accounts_str: str) -> str:
+    """Editable-settings summary for a draft/paused job. Source/dest/range are fixed."""
+    filter_status = f"כן ({word_count} מילים)" if job.use_blocked_words else "לא"
+    group_status = "כן" if job.group_media else "לא"
+    text_status = "כן" if job.copy_text else "לא"
+    continuous_status = "כן" if job.continuous else "לא"
+    status_label = job_status_label(job)
+    checkpoint = f"#{job.last_processed_id}" if job.last_processed_id else "—"
+
+    return (
+        f"{TITLE_EDIT_JOB}\n\n"
+        f"📋 <b>{esc(job.name)}</b> — {status_label}\n"
+        f"נקודת המשך שמורה: {checkpoint}\n\n"
+        f"<b>הגדרות ניתנות לעריכה:</b>\n"
+        f"🤖 חשבונות מריצים: {accounts_str}\n"
+        f"📁 סוגי תוכן: {_content_types_display(job.content_types)}\n"
+        f"🚫 סינון מילים: {filter_status}\n"
+        f"📦 שליחה במרוכז: {group_status}\n"
+        f"📝 העתקת טקסט: {text_status}\n"
+        f"🔄 סנכרון רציף: {continuous_status}\n\n"
+        f"<i>מקור/יעד/מצב/טווח אינם ניתנים לשינוי — כדי לשמר את נקודת ההמשך "
+        f"וההיסטוריה. לאחר העריכה לחץ 'המשך משימה' כדי להמשיך מהמקום שנעצר.</i>"
+    )
+
+
+def job_edit_accounts_text(job: "Job") -> str:
+    """The account allow-list picker, in the edit context."""
+    return (
+        f"{TITLE_EDIT_JOB}\n\n"
+        f"📋 <b>{esc(job.name)}</b>\n\n"
+        f"{WIZARD_SELECT_ACCOUNTS}"
+    )
+
+
+def job_edit_content_types_text(job: "Job") -> str:
+    return (
+        f"{TITLE_EDIT_JOB}\n\n"
+        f"📋 <b>{esc(job.name)}</b>\n\n"
+        f"{WIZARD_SELECT_CONTENT_TYPES}"
+    )
+
+
+def job_allowed_accounts_str(job: "Job") -> str:
+    """'כל החשבונות' or the comma-joined names of the job's allow-list."""
+    allowed = job.allowed_ids()
+    if not allowed:
+        return "כל החשבונות"
+    from app.repositories import userbot_repo
+
+    names = [
+        esc(ub.display())
+        for ub in (userbot_repo.get_by_id(i) for i in sorted(allowed))
+        if ub
+    ]
+    return ", ".join(names) if names else "כל החשבונות"
 
 
 DAILY_LIMIT = 20_000
@@ -896,6 +1022,165 @@ def settings_text(settings: dict[str, str]) -> str:
 def prompt_setting(key: str) -> str:
     label = SETTINGS_LABELS.get(key, key)
     return f"{TITLE_SETTINGS}\n\nהזן ערך חדש עבור <b>{label}</b>:"
+
+
+# ── Hyper backup ───────────────────────────────────────────────────────────────
+
+BTN_HYPER = "⚡ מצב הייפר"
+
+TITLE_HYPER = "⚡ <b>מצב הייפר — גיבוי אוטומטי</b>"
+
+# Media types a hyper filter can target, in display order.
+HYPER_TYPES = ("video", "image", "file", "audio")
+HYPER_TYPE_LABELS: dict[str, str] = {
+    "video": "🎬 סרטונים",
+    "image": "🖼 תמונות",
+    "file":  "📎 קבצים",
+    "audio": "🎵 אודיו",
+}
+# Only video/audio carry a duration; a size bound applies to every type.
+HYPER_TYPES_WITH_DURATION = frozenset({"video", "audio"})
+
+# Short codes used in callback data ↔ DB column names.
+HYPER_FIELD_COLUMNS: dict[str, str] = {
+    "minsize": "min_size",
+    "maxsize": "max_size",
+    "mindur":  "min_duration",
+    "maxdur":  "max_duration",
+}
+HYPER_FIELD_LABELS: dict[str, str] = {
+    "minsize": "גודל מינימלי",
+    "maxsize": "גודל מקסימלי",
+    "mindur":  "אורך מינימלי",
+    "maxdur":  "אורך מקסימלי",
+}
+
+
+def fmt_size(num_bytes: "int | None") -> str:
+    if not num_bytes:
+        return "—"
+    mb = num_bytes / (1024 * 1024)
+    if mb >= 1024:
+        return f"{mb / 1024:.1f}GB"
+    return f"{mb:.0f}MB" if mb >= 10 else f"{mb:.1f}MB"
+
+
+def fmt_duration(seconds: "int | None") -> str:
+    if not seconds:
+        return "—"
+    minutes = seconds / 60
+    if minutes >= 1:
+        return f"{minutes:.0f} דק׳"
+    return f"{seconds} שנ׳"
+
+
+def _rule_summary(media_type: str, rule: "dict | None") -> str:
+    """One-line summary of a type's filter: 'הכל' / 'כבוי' / the active bounds."""
+    if rule is None:
+        return "הכל"
+    if not rule.get("enabled", True):
+        return "כבוי"
+    parts: list[str] = []
+    if rule.get("min_size") is not None:
+        parts.append(f"≥{fmt_size(rule['min_size'])}")
+    if rule.get("max_size") is not None:
+        parts.append(f"≤{fmt_size(rule['max_size'])}")
+    if media_type in HYPER_TYPES_WITH_DURATION:
+        if rule.get("min_duration") is not None:
+            parts.append(f"≥{fmt_duration(rule['min_duration'])}")
+        if rule.get("max_duration") is not None:
+            parts.append(f"≤{fmt_duration(rule['max_duration'])}")
+    if not parts:
+        return "הכל"
+    joiner = " וגם " if (rule.get("combine") or "and") == "and" else " או "
+    return joiner.join(parts)
+
+
+def hyper_type_button(media_type: str, rule: "dict | None") -> str:
+    return f"{HYPER_TYPE_LABELS.get(media_type, media_type)}: {_rule_summary(media_type, rule)}"
+
+
+def hyper_account_list_text(userbots: list, statuses: dict) -> str:
+    if not userbots:
+        return (
+            f"{TITLE_HYPER}\n\n"
+            "אין חשבונות יוזרבוט. הוסף חשבון תחילה במסך החשבונות, "
+            "ואז אפשר להפעיל עליו גיבוי הייפר."
+        )
+    active = sum(1 for s in statuses.values() if s)
+    return (
+        f"{TITLE_HYPER}\n\n"
+        f"פעיל ב-<b>{active}</b> מתוך <b>{len(userbots)}</b> חשבונות\n\n"
+        "<i>הייפר מגבה אוטומטית כל קובץ/מדיה שחשבון מעלה (בכל צ׳אט) לערוץ גיבוי — "
+        "עם סינון חכם, בלי כפילויות, ובכפוף למכסה היומית.</i>\n\n"
+        "🟢 = פעיל | 🔴 = כבוי\n"
+        "בחר חשבון להגדרה וניהול:"
+    )
+
+
+def hyper_menu_text(ub, cfg: "dict | None", dst, queued: int = 0) -> str:
+    enabled = bool(cfg and cfg["enabled"])
+    status = "🟢 פעיל" if enabled else "🔴 כבוי"
+    dst_line = dst.display() if dst else "<i>לא נבחר</i>"
+    copied = (cfg or {}).get("copied_count", 0)
+    skipped = (cfg or {}).get("skipped_count", 0)
+    failed = (cfg or {}).get("failed_count", 0)
+    warn = ""
+    if enabled and not dst:
+        warn = "\n\n⚠️ בחר ערוץ גיבוי כדי שהמצב יתחיל לפעול."
+    queue_line = f"\n⏳ בתור להמשך: <b>{queued}</b> (ממתין למכסה/שליחה)" if queued else ""
+    return (
+        f"{TITLE_HYPER}\n\n"
+        f"חשבון: <b>{esc(ub.display())}</b>\n"
+        f"סטטוס: <b>{status}</b>\n"
+        f"ערוץ גיבוי: {esc(dst_line) if dst else dst_line}\n\n"
+        "<i>המצב מגבה אוטומטית כל קובץ/מדיה שהחשבון הזה מעלה, בכל צ׳אט, "
+        "לערוץ הגיבוי — עם סינון חכם ובלי כפילויות.</i>\n\n"
+        f"📊 גובו: <b>{copied}</b> | דולגו: <b>{skipped}</b> | נכשלו: <b>{failed}</b>"
+        f"{queue_line}"
+        f"{warn}"
+    )
+
+
+def hyper_type_text(ub, media_type: str, rule: "dict | None") -> str:
+    label = HYPER_TYPE_LABELS.get(media_type, media_type)
+    enabled = rule is None or rule.get("enabled", True)
+    combine = (rule or {}).get("combine", "and")
+    combine_label = "וגם (כל התנאים)" if combine == "and" else "או (לפחות תנאי אחד)"
+    lines = [
+        f"{TITLE_HYPER}\n",
+        f"חשבון: <b>{esc(ub.display())}</b>",
+        f"סוג: <b>{label}</b>",
+        f"סטטוס: <b>{'✅ מגובה' if enabled else '❌ מדולג'}</b>\n",
+    ]
+    if enabled:
+        lines.append(f"גודל מינימלי: <b>{fmt_size((rule or {}).get('min_size'))}</b>")
+        lines.append(f"גודל מקסימלי: <b>{fmt_size((rule or {}).get('max_size'))}</b>")
+        if media_type in HYPER_TYPES_WITH_DURATION:
+            lines.append(f"אורך מינימלי: <b>{fmt_duration((rule or {}).get('min_duration'))}</b>")
+            lines.append(f"אורך מקסימלי: <b>{fmt_duration((rule or {}).get('max_duration'))}</b>")
+        lines.append(f"\nחיבור תנאים: <b>{combine_label}</b>")
+        lines.append("\n<i>גבול ריק (—) = לא נבדק. ריק בכולם = מגבה הכל.</i>")
+    return "\n".join(lines)
+
+
+def hyper_dst_picker_text(ub) -> str:
+    return (
+        f"{TITLE_HYPER}\n\n"
+        f"חשבון: <b>{esc(ub.display())}</b>\n\n"
+        "בחר ערוץ גיבוי מתוך היעדים הקיימים:\n"
+        "<i>(כדי להוסיף ערוץ חדש — הוסף אותו תחילה במסך היעדים)</i>"
+    )
+
+
+def hyper_prompt_value(media_type: str, field: str) -> str:
+    label = HYPER_FIELD_LABELS.get(field, field)
+    unit = "בדקות" if field in ("mindur", "maxdur") else "במגה-בייט (MB)"
+    return (
+        f"{TITLE_HYPER}\n\n"
+        f"{HYPER_TYPE_LABELS.get(media_type, media_type)} — {label}\n\n"
+        f"הזן ערך {unit} (מספר). הזן 0 כדי לנקות את הגבול:"
+    )
 
 
 # ── Errors and confirmations ───────────────────────────────────────────────────

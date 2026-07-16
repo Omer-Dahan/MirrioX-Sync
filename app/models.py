@@ -12,6 +12,18 @@ ALL_CONTENT_TYPES = frozenset({"text", "image", "video", "file"})
 DEFAULT_CONTENT_TYPES = "file,image,text,video"
 
 
+def _parse_id_set(raw: Optional[str]) -> set[int]:
+    """Parse a comma-separated id list (e.g. '1,3,4') into a set of ints."""
+    if not raw:
+        return set()
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.add(int(part))
+    return out
+
+
 @dataclass
 class Admin:
     id: int
@@ -181,6 +193,7 @@ class Job:
     backfill_done: bool = False
     assigned_userbot_id: Optional[int] = None
     excluded_userbot_ids: Optional[str] = None
+    allowed_userbot_ids: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Job":
@@ -221,6 +234,7 @@ class Job:
             backfill_done=bool(row["backfill_done"]) if "backfill_done" in keys else False,
             assigned_userbot_id=row["assigned_userbot_id"] if "assigned_userbot_id" in keys else None,
             excluded_userbot_ids=row["excluded_userbot_ids"] if "excluded_userbot_ids" in keys else None,
+            allowed_userbot_ids=row["allowed_userbot_ids"] if "allowed_userbot_ids" in keys else None,
         )
 
     def is_active(self) -> bool:
@@ -231,14 +245,15 @@ class Job:
 
     def excluded_ids(self) -> set[int]:
         """Userbot IDs that already failed this job for lack of channel access."""
-        if not self.excluded_userbot_ids:
-            return set()
-        out: set[int] = set()
-        for part in self.excluded_userbot_ids.split(","):
-            part = part.strip()
-            if part.isdigit():
-                out.add(int(part))
-        return out
+        return _parse_id_set(self.excluded_userbot_ids)
+
+    def allowed_ids(self) -> set[int]:
+        """
+        Userbot IDs explicitly allowed to run this job (user-chosen allow-list).
+
+        An empty set means no restriction — any active account may run the job.
+        """
+        return _parse_id_set(self.allowed_userbot_ids)
 
 
 @dataclass

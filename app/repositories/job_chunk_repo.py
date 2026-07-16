@@ -18,8 +18,9 @@ from app import db
 from app.models import Job, JobChunk
 
 # Predicate on a joined `jobs j`: only jobs this account may work on — one it
-# wasn't excluded from, whose channels it isn't known to lack access to. Mirrors
-# job_repo's claim rules, and expects (str(userbot_id), userbot_id) as params.
+# wasn't excluded from, whose channels it isn't known to lack access to, and that
+# either has no allow-list or names this account in it. Mirrors job_repo's claim
+# rules, and expects (str(userbot_id), userbot_id, str(userbot_id)) as params.
 _CLAIMABLE_JOB = """
     j.status = 'running'
     AND (j.excluded_userbot_ids IS NULL OR j.excluded_userbot_ids = ''
@@ -29,6 +30,8 @@ _CLAIMABLE_JOB = """
                        AND ((ca.channel_kind = 'source' AND ca.channel_id = j.source_id)
                          OR (ca.channel_kind = 'destination'
                              AND ca.channel_id = j.destination_id)))
+    AND (j.allowed_userbot_ids IS NULL OR j.allowed_userbot_ids = ''
+         OR ',' || j.allowed_userbot_ids || ',' LIKE '%,' || ? || ',%')
 """
 
 
@@ -113,7 +116,7 @@ def claim_any(userbot_id: int) -> Optional[tuple[Job, JobChunk]]:
             ORDER BY COALESCE(j.submitted_at, j.created_at) ASC,
                      job_chunks.job_id ASC, job_chunks.id_from ASC
             LIMIT 1""",  # nosec B608 — fixed fragment with bound params
-        (str(userbot_id), userbot_id),
+        (str(userbot_id), userbot_id, str(userbot_id)),
     ).fetchone()
     if row is None:
         return None

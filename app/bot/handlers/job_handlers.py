@@ -20,6 +20,10 @@ async def dispatch(bot: TelegramClient, event, uid: int) -> None:
     await answer_callback(event)
     data: str = event.data.decode()
 
+    if data.startswith("je:"):
+        await _dispatch_edit(bot, data)
+        return
+
     if data == "menu:jobs":
         await _show_job_list(bot, uid)
     elif data == "job:new":
@@ -36,6 +40,14 @@ async def dispatch(bot: TelegramClient, event, uid: int) -> None:
         await _wizard_toggle_copy_text(bot, uid)
     elif data == "wzd:toggle_continuous":
         await _wizard_toggle_continuous(bot, uid)
+    elif data == "wzd:accounts":
+        await _wizard_show_accounts(bot, uid)
+    elif data == "wzd:all_ubs":
+        await _wizard_all_accounts(bot, uid)
+    elif data == "wzd:done_accounts":
+        await _wizard_show_summary_from(bot, uid)
+    elif data.startswith("wzd:toggle_ub:"):
+        await _wizard_toggle_userbot(bot, uid, int(data.split(":")[2]))
     elif data == "wzd:confirm":
         await _wizard_confirm(bot, uid)
     elif data.startswith("wzd:toggle_src:"):
@@ -80,6 +92,113 @@ async def _dispatch_job_action(bot: TelegramClient, uid: int, job_id: int, actio
         await _job_pause(bot, job_id)
     elif action == "resume":
         await _job_resume(bot, job_id)
+
+
+# ── Job edit (draft / paused) ────────────────────────────────────────────────
+
+async def _dispatch_edit(bot: TelegramClient, data: str) -> None:
+    """Route je:<job_id>:<action>[:<param>] callbacks for editing a job's soft settings."""
+    from app.repositories import job_repo, userbot_repo
+
+    parts = data.split(":")
+    if len(parts) < 3:
+        return
+    try:
+        job_id = int(parts[1])
+    except ValueError:
+        return
+    action = parts[2]
+    param = parts[3] if len(parts) > 3 else None
+
+    job = job_repo.get_by_id(job_id)
+    if job is None:
+        text, kb = renderer.render_error("משימה לא נמצאה", "jobs")
+        await update_main_message(bot, text, to_telethon(kb))
+        return
+    # Editing is only safe before a job is live: a draft, or a job the user paused.
+    if job.status not in ("draft", "paused"):
+        text, kb = renderer.render_error(
+            "ניתן לערוך רק משימות בטיוטה או מושהות. השהה את המשימה תחילה.", "jobs"
+        )
+        await update_main_message(bot, text, to_telethon(kb))
+        return
+
+    if action == "menu":
+        await _edit_show_menu(bot, job_id)
+    elif action == "tgl_filter":
+        job_repo.update_flags(job_id, use_blocked_words=not job.use_blocked_words)
+        await _edit_show_menu(bot, job_id)
+    elif action == "tgl_group":
+        job_repo.update_flags(job_id, group_media=not job.group_media)
+        await _edit_show_menu(bot, job_id)
+    elif action == "tgl_text":
+        job_repo.update_flags(job_id, copy_text=not job.copy_text)
+        await _edit_show_menu(bot, job_id)
+    elif action == "tgl_cont":
+        job_repo.update_flags(job_id, continuous=not job.continuous)
+        await _edit_show_menu(bot, job_id)
+    elif action == "reset_excl":
+        job_repo.reset_exclusions(job_id)
+        logger.info("Job #%d: access exclusions reset by user via edit", job_id)
+        await _edit_show_menu(bot, job_id)
+    elif action == "accounts":
+        await _edit_show_accounts(bot, job_id)
+    elif action == "all_ubs":
+        job_repo.set_allowed_userbots(job_id, None)
+        await _edit_show_accounts(bot, job_id)
+    elif action == "ub" and param is not None:
+        await _edit_toggle_userbot(bot, job, int(param))
+    elif action == "types":
+        await _edit_show_content_types(bot, job_id)
+    elif action == "type" and param is not None:
+        await _edit_toggle_type(bot, job, param)
+
+
+async def _edit_show_menu(bot: TelegramClient, job_id: int) -> None:
+    text, kb = renderer.render_job_edit(job_id)
+    await update_main_message(bot, text, to_telethon(kb))
+
+
+async def _edit_show_accounts(bot: TelegramClient, job_id: int) -> None:
+    text, kb = renderer.render_job_edit_accounts(job_id)
+    await update_main_message(bot, text, to_telethon(kb))
+
+
+async def _edit_show_content_types(bot: TelegramClient, job_id: int) -> None:
+    text, kb = renderer.render_job_edit_content_types(job_id)
+    await update_main_message(bot, text, to_telethon(kb))
+
+
+async def _edit_toggle_userbot(bot: TelegramClient, job, userbot_id: int) -> None:
+    from app.repositories import job_repo, userbot_repo
+
+    active_ids = {u.id for u in userbot_repo.get_active()}
+    # An empty allow-list means "all accounts", so start from the full active set.
+    current = job.allowed_ids() or set(active_ids)
+    if userbot_id in current:
+        current.discard(userbot_id)
+    else:
+        current.add(userbot_id)
+    # A job with no allowed account could never run — ignore the toggle that empties it.
+    if current:
+        # All active accounts selected (and nothing stale) collapses back to "no limit".
+        value = None if current == active_ids else ",".join(str(i) for i in sorted(current))
+        job_repo.set_allowed_userbots(job.id, value)
+    await _edit_show_accounts(bot, job.id)
+
+
+async def _edit_toggle_type(bot: TelegramClient, job, type_name: str) -> None:
+    from app.repositories import job_repo
+
+    selected = {p.strip() for p in (job.content_types or DEFAULT_CONTENT_TYPES).split(",") if p.strip()}
+    if type_name in selected:
+        selected.discard(type_name)
+    else:
+        selected.add(type_name)
+    # At least one content type must remain selected.
+    if selected:
+        job_repo.set_content_types(job.id, ",".join(sorted(selected)))
+    await _edit_show_content_types(bot, job.id)
 
 
 # ── Job list ───────────────────────────────────────────────────────────────────
@@ -181,6 +300,8 @@ def _init_wizard(uid: int) -> dict:
         "copy_text": True,
         "continuous": False,
         "content_types": set(ALL_CONTENT_TYPES),
+        # None = not customized (all accounts). A set = the chosen allow-list.
+        "allowed_ubs": None,
     }
     return ud["wizard"]
 
@@ -380,15 +501,74 @@ async def _wizard_done_types(bot: TelegramClient, uid: int) -> None:
 
 
 async def _wizard_show_summary(bot: TelegramClient, w: dict) -> None:
+    from app.repositories import userbot_repo
+
     word_count = filter_repo.count()
     text = texts.wizard_summary_text(w, word_count)
+    # The account picker is only meaningful with more than one active account.
+    accounts_label = (
+        texts.wizard_accounts_label(w) if userbot_repo.count_active() > 1 else None
+    )
     kb = keyboards.kb_wizard_summary(
         w.get("use_blocked_words", True),
         w.get("group_media", True),
         w.get("copy_text", True),
         w.get("continuous", False),
+        accounts_label=accounts_label,
     )
     await update_main_message(bot, text, to_telethon(kb))
+
+
+async def _wizard_show_summary_from(bot: TelegramClient, uid: int) -> None:
+    w = _get_wizard(uid)
+    if w:
+        await _wizard_show_summary(bot, w)
+
+
+# ── Account allow-list selection ─────────────────────────────────────────────
+
+async def _wizard_show_accounts(bot: TelegramClient, uid: int) -> None:
+    from app.repositories import userbot_repo
+
+    w = _get_wizard(uid)
+    if not w:
+        return
+    active = userbot_repo.get_active()
+    selected = w.get("allowed_ubs")
+    if selected is None:
+        # First visit: start from "all selected" so leaving it as-is means no limit.
+        selected = {u.id for u in active}
+        w["allowed_ubs"] = selected
+    text, kb = renderer.render_wizard_step(
+        texts.WIZARD_SELECT_ACCOUNTS, w, keyboards.kb_wizard_userbot_list(active, selected)
+    )
+    await update_main_message(bot, text, to_telethon(kb))
+
+
+async def _wizard_toggle_userbot(bot: TelegramClient, uid: int, userbot_id: int) -> None:
+    from app.repositories import userbot_repo
+
+    w = _get_wizard(uid)
+    if not w:
+        return
+    selected: set = w.get("allowed_ubs")
+    if selected is None:
+        selected = {u.id for u in userbot_repo.get_active()}
+        w["allowed_ubs"] = selected
+    if userbot_id in selected:
+        selected.discard(userbot_id)
+    else:
+        selected.add(userbot_id)
+    await _wizard_show_accounts(bot, uid)
+
+
+async def _wizard_all_accounts(bot: TelegramClient, uid: int) -> None:
+    """Reset to 'all accounts' (no restriction) and return to the summary."""
+    w = _get_wizard(uid)
+    if not w:
+        return
+    w["allowed_ubs"] = None
+    await _wizard_show_summary(bot, w)
 
 
 async def _wizard_confirm(bot: TelegramClient, uid: int) -> None:
@@ -407,6 +587,18 @@ async def _wizard_confirm(bot: TelegramClient, uid: int) -> None:
 
     name_base = w.get("name")
     dst_label = (w.get("dest_name") or "יעד").split("(")[0].strip()
+
+    # Resolve the account allow-list once for every job the wizard creates.
+    # A selection covering all active accounts (or the untouched default) imposes
+    # no restriction and is stored as NULL.
+    from app.repositories import userbot_repo
+
+    selected = w.get("allowed_ubs")
+    active_ids = {u.id for u in userbot_repo.get_active()}
+    if selected and not (set(selected) >= active_ids):
+        allowed_str = ",".join(str(i) for i in sorted(selected))
+    else:
+        allowed_str = None
 
     try:
         created = []
@@ -438,6 +630,7 @@ async def _wizard_confirm(bot: TelegramClient, uid: int) -> None:
                 content_types=content_types_str,
                 created_by=uid,
                 continuous=w.get("continuous", False),
+                allowed_userbot_ids=allowed_str,
             )
             created.append(job)
 

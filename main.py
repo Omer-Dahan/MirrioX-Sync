@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import logging.handlers
 import os
 import signal
 import sys
@@ -217,13 +218,58 @@ def _force_utf8_output() -> None:
             pass
 
 
+def _add_rotating_file_handler(formatter: logging.Formatter) -> None:
+    """
+    Mirror all logging to an hourly-rotating text file, keeping ~24 hours back.
+
+    The service runs on a headless Linux box where stdout is not captured to a
+    file, so a crash or a subtle bug (e.g. an account sending past its daily cap)
+    leaves nothing to inspect afterwards. An hourly TimedRotatingFileHandler with
+    backupCount = retention_hours keeps exactly that window on disk and deletes
+    anything older automatically, so the logs never grow without bound.
+
+    Controlled by environment variables (all optional):
+      LOG_TO_FILE          "1"/"0" — enable file logging (default: enabled)
+      LOG_DIR              directory for the log files (default: "logs")
+      LOG_RETENTION_HOURS  how many hours back to keep (default: 24)
+    """
+    if os.environ.get("LOG_TO_FILE", "1").strip() not in ("1", "true", "True"):
+        return
+
+    log_dir = os.environ.get("LOG_DIR", "logs").strip() or "logs"
+    try:
+        retention_hours = int(os.environ.get("LOG_RETENTION_HOURS", "24").strip())
+    except ValueError:
+        retention_hours = 24
+    retention_hours = max(retention_hours, 1)
+
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        handler = logging.handlers.TimedRotatingFileHandler(
+            filename=os.path.join(log_dir, "mirriox.log"),
+            when="H",            # rotate every hour on the hour
+            interval=1,
+            backupCount=retention_hours,  # keep this many rotated files → hours back
+            encoding="utf-8",
+            utc=True,            # match the UTC timestamps used elsewhere
+        )
+        handler.setFormatter(formatter)
+        logging.getLogger().addHandler(handler)
+    except OSError as exc:
+        # A logging problem must never take the whole service down — stderr still works.
+        logging.getLogger(__name__).warning("Could not enable file logging: %s", exc)
+
+
 def _setup_logging() -> None:
     _force_utf8_output()
+    log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    date_format = "%Y-%m-%d %H:%M:%S"
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        format=log_format,
+        datefmt=date_format,
     )
+    _add_rotating_file_handler(logging.Formatter(log_format, datefmt=date_format))
     logging.getLogger("telethon").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)

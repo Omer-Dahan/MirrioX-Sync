@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="app/ui/MirrioX-Sync.png" alt="MirrioX Sync — Intelligent Telegram Backup & Sync Automation Bot" width="100%">
+<img src="app/ui/MirrioX-Sync.png" alt="MirrioX Sync: Intelligent Telegram Backup & Sync Automation Bot" width="100%">
 
 <br>
 
 ### Intelligent Telegram Backup &amp; Sync Automation
 
-**Copy entire Telegram channels — history, albums, media and all — across as many userbot accounts as you own.**<br>
+**Copy entire Telegram channels (history, albums, media and all) across as many userbot accounts as you own.**<br>
 Hebrew management bot. Crash-proof checkpoints. Real parallelism.
 
 <br>
@@ -73,7 +73,7 @@ Hebrew management bot. Crash-proof checkpoints. Real parallelism.
 <td width="33%" valign="top">
 
 ### 🤖 Truly parallel
-One runner **per userbot account**, all copying at once — across jobs, and *inside* a single job once two accounts can reach its channels.
+One runner **per userbot account**, all copying at once: across jobs, and *inside* a single job once two accounts can reach its channels.
 
 </td>
 <td width="33%" valign="top">
@@ -113,7 +113,7 @@ Media groups stay grouped. "No forwarding" channels fall back to download-and-re
 <td valign="top">
 
 ### 🔄 Continuous sync
-Copy the history, then keep listening for new messages in real time — with the same filters and dedup.
+Copy the history, then keep listening for new messages in real time, with the same filters and dedup.
 
 </td>
 <td valign="top">
@@ -125,7 +125,7 @@ Scan a channel for duplicated media, get a Telegraph report with links, and bulk
 <td valign="top">
 
 ### 🇮🇱 Hebrew control panel
-A single message, edited in place — never a wall of new ones. Jobs, sources, filters and settings, all inline.
+A single message, edited in place, never a wall of new ones. Jobs, sources, filters and settings, all inline.
 
 </td>
 </tr>
@@ -151,7 +151,7 @@ graph TD
         UI["🇮🇱 Hebrew control panel"]
     end
 
-    DB[("🗄️ SQLite — WAL")]
+    DB[("🗄️ SQLite · WAL")]
 
     subgraph WORKER["👷 Userbot Worker"]
         M["🎛 UserbotManager"]
@@ -194,16 +194,16 @@ stateDiagram-v2
 ## 🚀 Quick Start
 
 ```bash
-# 1 — install
+# 1 · install
 pip install -r requirements.txt
 
-# 2 — configure
+# 2 · configure
 cp example.env .env      # then fill it in (see below)
 
-# 3 — authenticate the userbot (one time, asks for phone + code)
+# 3 · authenticate the userbot (one time, asks for phone + code)
 python main.py setup
 
-# 4 — go
+# 4 · go
 python main.py all
 ```
 
@@ -221,7 +221,7 @@ python main.py all
 | `ADMIN_IDS` | Comma-separated Telegram user IDs allowed to use the bot |
 
 The `.env` account is registered automatically as the **default** userbot on first
-run. Every account after that is added from the bot UI — no `.env` edits needed.
+run. Every account after that is added from the bot UI, with no `.env` edits needed.
 
 </details>
 
@@ -232,7 +232,7 @@ run. Every account after that is added from the bot UI — no `.env` edits neede
 
 | Command | What it starts |
 |:---|:---|
-| `python main.py all` | Bot **and** worker in one process — simplest |
+| `python main.py all` | Bot **and** worker in one process (simplest) |
 | `python main.py bot` | Management bot only |
 | `python main.py worker` | Userbot worker only |
 | `python main.py setup` | One-time session authentication |
@@ -270,11 +270,11 @@ graph LR
     style F fill:#D98324,stroke:#D98324,color:#fff
 ```
 
-1. 🚀 Send `/start` to the management bot — a Hebrew control panel appears
+1. 🚀 Send `/start` to the management bot, and a Hebrew control panel appears
 2. ➕ Add source and destination channels via the UI
 3. 🤖 *(optional)* Add more userbot accounts: <kbd>⚙️ הגדרות</kbd> → <kbd>🤖 חשבונות יוזרבוט</kbd>
 4. 📝 Create a job (pick a copy mode and its parameters)
-5. 📤 Submit — the worker picks it up automatically
+5. 📤 Submit, and the worker picks it up automatically
 6. 📊 Watch progress in the job detail screen (press Refresh)
 
 ---
@@ -317,20 +317,20 @@ graph TD
 
 ### How work is shared
 
-- **Across jobs** — two queued jobs and two accounts means each takes a whole job of
+- **Across jobs.** Two queued jobs and two accounts mean each takes a whole job of
   its own. Always preferred: it is the fastest option *and* it preserves message
   order everywhere.
-- **Within one job** — when nothing new is left to claim, free accounts join a job
+- **Within one job.** When nothing new is left to claim, free accounts join a job
   already in progress. The account that claimed it (its **leader**) checks how many
   active accounts can reach **both** channels:
 
 | Accounts with access | What happens |
 |:---:|:---|
-| **1** | A single ascending pass — exactly how a single-account install behaves |
+| **1** | A single ascending pass, exactly how a single-account install behaves |
 | **2+** | The source ID range is split into ~200 chunks; every free account claims chunks of its own |
 
 Chunks are claimed atomically, so **no two accounts ever touch the same message**.
-Throughput scales with the number of accounts — and so does the daily quota, since
+Throughput scales with the number of accounts, and so does the daily quota, since
 Telegram enforces its limits per account.
 
 > [!WARNING]
@@ -346,13 +346,13 @@ Telegram enforces its limits per account.
 > Almost everything Telegram enforces is **per account**, not per job. The design
 > follows that boundary rather than fighting it.
 
-- **Access is per account** — one account may be a member of a channel while another
+- **Access is per account.** One account may be a member of a channel while another
   is not. Each probes every channel for itself, and the channel detail screen reports
   exactly who can reach it.
-- **The daily cap is per account** — a spent account simply stops claiming while the
+- **The daily cap is per account.** A spent account simply stops claiming while the
   others carry on. Only when *every* account is capped does the queue park until
   midnight (Israel time), and the admin is told.
-- **Adding an account** clears every job's exclusion list — a new account may have
+- **Adding an account** clears every job's exclusion list, since a new account may have
   access where the others didn't, so failed jobs get another chance.
 
 ---
@@ -392,8 +392,8 @@ download-and-reupload.
 
 ## 🔒 Blocked Words
 
-Configure a list of blocked words in the bot UI. Any message containing one — in
-text *or* caption — is skipped **entirely**. No editing, no partial removal: the
+Configure a list of blocked words in the bot UI. Any message containing one, in
+text *or* caption, is skipped **entirely**. No editing, no partial removal: the
 whole message is skipped, and the count is tracked per job.
 
 ---
@@ -404,11 +404,11 @@ Built to survive process crashes:
 
 | | Guarantee |
 |:---:|:---|
-| 🔄 | **Worker crash mid-job** — on next startup the worker spots the `running` job and re-queues it as `pending`. Every account assignment and held chunk from the previous run is released. |
-| 📍 | **Resume from checkpoint** — an unsharded job resumes from `jobs.last_processed_id`. A sharded job keeps a checkpoint **per chunk**, so only the unfinished part of an interrupted chunk is redone. Finished chunks are never revisited. |
-| 🫀 | **Abandoned chunks** — a chunk whose owner has been silent for 30 minutes goes back to the queue. The window is deliberately generous: reclaiming too early would let two accounts copy the same messages. |
-| 🛟 | **Duplicate prevention** — `copied_messages` records every processed source message ID. Nothing there is ever re-sent, even if a checkpoint is stale. |
-| 🕒 | **FloodWait** — the job moves to `waiting_retry` with a `next_retry_at`, which the poll loop honours across restarts. A flood wait on a *helper* account never stalls the job; the others keep going. |
+| 🔄 | **Worker crash mid-job.** On next startup the worker spots the `running` job and re-queues it as `pending`. Every account assignment and held chunk from the previous run is released. |
+| 📍 | **Resume from checkpoint.** An unsharded job resumes from `jobs.last_processed_id`. A sharded job keeps a checkpoint **per chunk**, so only the unfinished part of an interrupted chunk is redone. Finished chunks are never revisited. |
+| 🫀 | **Abandoned chunks.** A chunk whose owner has been silent for 30 minutes goes back to the queue. The window is deliberately generous: reclaiming too early would let two accounts copy the same messages. |
+| 🛟 | **Duplicate prevention.** `copied_messages` records every processed source message ID. Nothing there is ever re-sent, even if a checkpoint is stale. |
+| 🕒 | **FloodWait.** The job moves to `waiting_retry` with a `next_retry_at`, which the poll loop honours across restarts. A flood wait on a *helper* account never stalls the job; the others keep going. |
 
 ---
 
@@ -428,7 +428,7 @@ app/
 │
 ├── 📂 repositories/              # 🗃️ Database access (one file per entity)
 │   ├── 📄 job_repo.py            # job lifecycle, additive progress, atomic claiming
-│   ├── 📄 job_chunk_repo.py      # 🧩 chunk planning/claiming — parallel copying
+│   ├── 📄 job_chunk_repo.py      # 🧩 chunk planning/claiming, parallel copying
 │   ├── 📄 userbot_repo.py        # userbot accounts, sessions, default account
 │   ├── 📄 channel_access_repo.py # per-account channel access results
 │   ├── 📄 dedup_repo.py          # global transferred-content registry
@@ -481,7 +481,7 @@ app/
 | 🌊 | FloodWait buffer | **5 – 10s** extra, random |
 | 🔄 | Max retries | **5** before a job fails or pauses |
 | 📅 | Daily limit | **20,000 messages per account** |
-| ⚡ | Concurrency | One runner per active account — all working at once |
+| ⚡ | Concurrency | One runner per active account, all working at once |
 
 <br>
 

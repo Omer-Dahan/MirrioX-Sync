@@ -114,7 +114,12 @@ async def run_async(config: Config) -> None:
             elif data.startswith("page:"):
                 await _handle_paging(bot, event, data)
 
-            elif data.startswith("job:") or data.startswith("wzd:") or data == "menu:jobs":
+            elif (
+                data.startswith("job:")
+                or data.startswith("wzd:")
+                or data.startswith("je:")
+                or data == "menu:jobs"
+            ):
                 from app.bot.handlers import job_handlers
                 await job_handlers.dispatch(bot, event, uid)
 
@@ -141,6 +146,10 @@ async def run_async(config: Config) -> None:
             elif data.startswith("ub:") or data == "menu:userbots":
                 from app.bot.handlers import userbot_handlers
                 await userbot_handlers.dispatch(bot, event, uid)
+
+            elif data.startswith("hyp:"):
+                from app.bot.handlers import hyper_handlers
+                await hyper_handlers.dispatch(bot, event, uid)
 
             elif data == "menu:stats":
                 await event.answer()
@@ -199,6 +208,7 @@ async def run_async(config: Config) -> None:
             "userbot_phone":    ("userbot_handlers", "handle_userbot_phone"),
             "userbot_code":     ("userbot_handlers", "handle_userbot_code"),
             "userbot_2fa":      ("userbot_handlers", "handle_userbot_2fa"),
+            "hyper_value":      ("hyper_handlers",  "handle_hyper_value"),
         }
         entry = _dispatch_text.get(awaiting)
         if entry:

@@ -26,6 +26,7 @@ def create_draft_job(
     content_types: str = DEFAULT_CONTENT_TYPES,
     created_by: Optional[int] = None,
     continuous: bool = False,
+    allowed_userbot_ids: Optional[str] = None,
 ) -> Job:
     """Create a job in draft state. Raises JobError on invalid input."""
     src = source_repo.get_source_by_id(source_id)
@@ -59,6 +60,7 @@ def create_draft_job(
         content_types=content_types,
         created_by=created_by,
         continuous=continuous,
+        allowed_userbot_ids=allowed_userbot_ids,
     )
 
 

@@ -42,6 +42,47 @@ def render_job_detail(job_id: int) -> tuple[str, InlineKeyboardMarkup]:
     return texts.job_detail_text(job, src, dst, queue_pos), keyboards.kb_job_detail(job)
 
 
+def render_job_edit(job_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    from app.repositories import job_repo, userbot_repo
+    job = job_repo.get_by_id(job_id)
+    if job is None:
+        return texts.error_text(f"משימה #{job_id} לא נמצאה"), keyboards.kb_error_back("jobs")
+    word_count = filter_repo.count()
+    accounts_str = texts.job_allowed_accounts_str(job)
+    multi_account = userbot_repo.count_active() > 1
+    return (
+        texts.job_edit_text(job, word_count, accounts_str),
+        keyboards.kb_job_edit(job, multi_account=multi_account),
+    )
+
+
+def render_job_edit_accounts(job_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    from app.repositories import job_repo, userbot_repo
+    job = job_repo.get_by_id(job_id)
+    if job is None:
+        return texts.error_text(f"משימה #{job_id} לא נמצאה"), keyboards.kb_error_back("jobs")
+    active = userbot_repo.get_active()
+    # An empty allow-list means "all accounts" — show every active account ticked.
+    selected = job.allowed_ids() or {u.id for u in active}
+    return (
+        texts.job_edit_accounts_text(job),
+        keyboards.kb_job_edit_userbots(job_id, active, selected),
+    )
+
+
+def render_job_edit_content_types(job_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    from app.models import DEFAULT_CONTENT_TYPES
+    from app.repositories import job_repo
+    job = job_repo.get_by_id(job_id)
+    if job is None:
+        return texts.error_text(f"משימה #{job_id} לא נמצאה"), keyboards.kb_error_back("jobs")
+    selected = {p.strip() for p in (job.content_types or DEFAULT_CONTENT_TYPES).split(",") if p.strip()}
+    return (
+        texts.job_edit_content_types_text(job),
+        keyboards.kb_job_edit_content_types(job_id, selected),
+    )
+
+
 def render_job_confirm_delete(job: "Job") -> tuple[str, InlineKeyboardMarkup]:
     return (
         texts.confirm_delete_job_text(job.name),
@@ -124,6 +165,49 @@ def render_userbot_confirm_remove(userbot_id: int) -> tuple[str, InlineKeyboardM
         texts.confirm_remove_userbot_text(ub.display()),
         keyboards.kb_confirm_remove_userbot(userbot_id),
     )
+
+
+def render_hyper_account_list() -> tuple[str, InlineKeyboardMarkup]:
+    from app.repositories import userbot_repo, hyper_repo
+    userbots = userbot_repo.get_all()
+    statuses = {}
+    for ub in userbots:
+        cfg = hyper_repo.get_config(ub.id)
+        statuses[ub.id] = bool(cfg and cfg["enabled"] and cfg["destination_id"])
+    return texts.hyper_account_list_text(userbots, statuses), keyboards.kb_hyper_account_list(userbots, statuses)
+
+
+def render_hyper_menu(acc_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    from app.repositories import userbot_repo, hyper_repo
+    ub = userbot_repo.get_by_id(acc_id)
+    if ub is None:
+        return texts.error_text("חשבון לא נמצא"), keyboards.kb_error_back("userbots")
+    hyper_repo.ensure_config(acc_id)
+    cfg = hyper_repo.get_config(acc_id)
+    filters = hyper_repo.get_filters(acc_id)
+    dst = None
+    if cfg and cfg.get("destination_id"):
+        dst = source_repo.get_destination_by_id(cfg["destination_id"])
+    queued = hyper_repo.queue_count(acc_id)
+    return texts.hyper_menu_text(ub, cfg, dst, queued), keyboards.kb_hyper_menu(acc_id, cfg, dst, filters)
+
+
+def render_hyper_type(acc_id: int, media_type: str) -> tuple[str, InlineKeyboardMarkup]:
+    from app.repositories import userbot_repo, hyper_repo
+    ub = userbot_repo.get_by_id(acc_id)
+    if ub is None:
+        return texts.error_text("חשבון לא נמצא"), keyboards.kb_error_back("userbots")
+    rule = hyper_repo.get_filter(acc_id, media_type)
+    return texts.hyper_type_text(ub, media_type, rule), keyboards.kb_hyper_type(acc_id, media_type, rule)
+
+
+def render_hyper_dst_picker(acc_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    from app.repositories import userbot_repo
+    ub = userbot_repo.get_by_id(acc_id)
+    if ub is None:
+        return texts.error_text("חשבון לא נמצא"), keyboards.kb_error_back("userbots")
+    dests = source_repo.get_all_destinations()
+    return texts.hyper_dst_picker_text(ub), keyboards.kb_hyper_dst_picker(acc_id, dests)
 
 
 def render_transfer_stats() -> tuple[str, InlineKeyboardMarkup]:

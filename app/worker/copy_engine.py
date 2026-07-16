@@ -247,7 +247,13 @@ class CopyEngine:
         # access even if its own probe hasn't been recorded yet.
         if self._userbot_id is not None:
             with_access.add(self._userbot_id)
-        return (active & with_access) - job.excluded_ids()
+        eligible = (active & with_access) - job.excluded_ids()
+        # A user-chosen allow-list caps who may run the job. Intersecting here
+        # keeps a job restricted to one account from being sharded across several.
+        allowed = job.allowed_ids()
+        if allowed:
+            eligible &= allowed
+        return eligible
 
     async def _shard_bounds(self, job: Job, ctx: _JobContext) -> Optional[tuple[int, int]]:
         """The lowest and highest source message ID this job still has to cover."""
@@ -1117,6 +1123,94 @@ class CopyEngine:
             job.id, msg.id, status, f" ({skip_reason})" if skip_reason else "",
         )
         return status
+
+    # ── Hyper backup ───────────────────────────────────────────────────────────
+
+    async def handle_hyper_message(
+        self, dst_rec, msg: Message, rules: dict, is_capped: Optional[Callable[[], bool]] = None
+    ) -> str:
+        """
+        Back up one outgoing message to the account's hyper backup channel.
+
+        Media only (text returns 'skipped'), gated by the per-account smart
+        filter, and always de-duplicated against the destination — hyper's whole
+        point is "don't store the same file twice", so dedup is forced on here
+        regardless of the global skip_duplicates setting. The loop-guard that
+        stops us backing up our own backup lives in the caller (it compares the
+        event's chat to the backup channel before we ever get here).
+
+        `is_capped` is checked only *after* the filter and dedup pass, so an item
+        that would be sent but for the daily cap returns 'queued' (the caller
+        parks it for later) — we never queue junk or duplicates.
+
+        Returns: copied | skipped | queued | failed.
+        """
+        from app.services import hyper_filter
+        from app.worker.telegram_utils import get_entity_safe
+
+        if msg is None or not hasattr(msg, "id"):
+            return "skipped"
+
+        media_type = hyper_filter.hyper_media_type(msg)
+        if media_type is None:
+            return "skipped"  # text / service / unclassifiable — not backed up
+
+        size, duration = hyper_filter.extract_size_duration(msg)
+        passes, reason = hyper_filter.evaluate(media_type, size, duration, rules)
+        if not passes:
+            logger.debug("Hyper: msg #%s skipped by filter (%s/%s)", msg.id, media_type, reason)
+            return "skipped"
+
+        # Content dedup, forced on and cross-account: the registry is keyed by
+        # (destination, content), so whichever account already sent this file to
+        # the backup channel makes every other account skip it.
+        if dedup_repo.is_duplicate(msg, dst_rec.id):
+            logger.debug("Hyper: msg #%s already in backup — skipped", msg.id)
+            return "skipped"
+
+        # Out of daily quota: don't send now, let the caller queue it for later.
+        # Checked here (not before the filter) so only real, non-duplicate work
+        # is ever parked.
+        if is_capped is not None and is_capped():
+            return "queued"
+
+        try:
+            dst_entity = await get_entity_safe(
+                self._client, str(dst_rec.resolved_id or dst_rec.channel_ref)
+            )
+        except Exception as e:  # noqa: BLE001 — any resolution failure means we can't back up now
+            logger.warning("Hyper: cannot resolve backup channel (%s)", e)
+            return "failed"
+
+        try:
+            # drop_author keeps the backup clean (no "forwarded from"); the source
+            # peer is taken from the message itself.
+            await self._client.forward_messages(dst_entity, msg, drop_author=True)
+        except ChatForwardsRestrictedError:
+            try:
+                await self._send_as_copy(msg, dst_entity, copy_text=True)
+            except FloodWaitError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Hyper: download+upload fallback failed for #%s: %s", msg.id, e)
+                return "failed"
+        except FloodWaitError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Hyper: forward failed for #%s: %s", msg.id, e)
+            return "failed"
+
+        self._record_hyper_transfer(dst_rec.id, msg)
+        await self._rate_limiter.wait()
+        logger.info("Hyper: backed up msg #%s (%s) → dest #%d", msg.id, media_type, dst_rec.id)
+        return "copied"
+
+    def _record_hyper_transfer(self, destination_id: int, msg: Message) -> None:
+        """Register a hyper transfer: dedup registry + the per-account daily-cap counter."""
+        from app.repositories import hyper_repo
+        dedup_repo.record_message(msg, destination_id=destination_id, source_id=None, job_id=None)
+        if self._userbot_id is not None:
+            hyper_repo.record_send(self._userbot_id)
 
     async def _forward_without_credit(
         self, msg: Message, src_entity, dst_entity

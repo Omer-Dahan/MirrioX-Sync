@@ -93,6 +93,7 @@ def kb_job_detail(job: "Job") -> InlineKeyboardMarkup:
 
     if job.status == "draft":
         rows.append([_btn(texts.BTN_SUBMIT_JOB, f"job:{job.id}:submit")])
+        rows.append([_btn(texts.BTN_EDIT_JOB, f"je:{job.id}:menu")])
         rows.append([_btn(texts.BTN_DELETE_JOB, f"job:{job.id}:confirm_delete")])
 
     if job.status in ("pending", "running", "waiting_retry"):
@@ -103,6 +104,7 @@ def kb_job_detail(job: "Job") -> InlineKeyboardMarkup:
     if job.status == "paused":
         resume_label = texts.BTN_START_LISTENING if job.continuous else texts.BTN_RESUME_JOB
         rows.append([_btn(resume_label, f"job:{job.id}:resume")])
+        rows.append([_btn(texts.BTN_EDIT_JOB, f"je:{job.id}:menu")])
         rows.append([_btn(texts.BTN_DELETE_JOB, f"job:{job.id}:confirm_delete")])
 
     if job.is_terminal():
@@ -130,6 +132,62 @@ def kb_confirm_cancel_job(job_id: int) -> InlineKeyboardMarkup:
         _btn(texts.BTN_YES_CANCEL, f"job:{job_id}:cancel"),
         _btn(texts.BTN_CANCEL, f"job:{job_id}:view"),
     ]])
+
+
+# ── Job edit (draft / paused) ────────────────────────────────────────────────
+
+def kb_job_edit(job: "Job", multi_account: bool = True) -> InlineKeyboardMarkup:
+    """Edit menu for the 'soft' settings of a draft/paused job."""
+    jid = job.id
+    filter_btn = texts.BTN_FILTER_TOGGLE_ON if job.use_blocked_words else texts.BTN_FILTER_TOGGLE_OFF
+    group_btn = texts.BTN_GROUP_TOGGLE_ON if job.group_media else texts.BTN_GROUP_TOGGLE_OFF
+    text_btn = texts.BTN_TEXT_TOGGLE_ON if job.copy_text else texts.BTN_TEXT_TOGGLE_OFF
+    cont_btn = texts.BTN_CONTINUOUS_ON if job.continuous else texts.BTN_CONTINUOUS_OFF
+    rows = []
+    if multi_account:
+        rows.append([_btn(texts.BTN_EDIT_ACCOUNTS, f"je:{jid}:accounts")])
+    rows.append([_btn(texts.BTN_EDIT_CONTENT_TYPES, f"je:{jid}:types")])
+    rows.append([_btn(filter_btn, f"je:{jid}:tgl_filter")])
+    rows.append([_btn(group_btn, f"je:{jid}:tgl_group")])
+    rows.append([_btn(text_btn, f"je:{jid}:tgl_text")])
+    rows.append([_btn(cont_btn, f"je:{jid}:tgl_cont")])
+    rows.append([_btn(texts.BTN_RESET_EXCLUSIONS, f"je:{jid}:reset_excl")])
+    rows.append([_btn(texts.BTN_BACK, f"job:{jid}:view")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_job_edit_userbots(
+    job_id: int, userbots: list, selected_ids: set[int] | None = None
+) -> InlineKeyboardMarkup:
+    """Multi-select of allowed accounts, editing an existing job."""
+    if selected_ids is None:
+        selected_ids = set()
+    rows = []
+    row: list = []
+    for ub in userbots:
+        check = "✅" if ub.id in selected_ids else "◻"
+        row.append(_btn(f"{check} {ub.display()[:30]}", f"je:{job_id}:ub:{ub.id}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([_btn(texts.BTN_WZD_ALL_ACCOUNTS, f"je:{job_id}:all_ubs")])
+    rows.append([_btn(texts.BTN_BACK, f"je:{job_id}:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_job_edit_content_types(job_id: int, selected: set) -> InlineKeyboardMarkup:
+    def chk(t: str) -> str:
+        return "✅" if t in selected else "◻"
+    rows = [
+        [_btn(f"{chk('image')} 🖼 תמונות (ומדבקות)", f"je:{job_id}:type:image")],
+        [_btn(f"{chk('video')} 🎬 סרטונים (וGIF)", f"je:{job_id}:type:video")],
+        [_btn(f"{chk('file')} 📎 קבצים (מסמכים ואודיו)", f"je:{job_id}:type:file")],
+        [_btn(f"{chk('text')} 💬 טקסט", f"je:{job_id}:type:text")],
+        [_btn(texts.BTN_BACK, f"je:{job_id}:menu")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 # ── Wizard ─────────────────────────────────────────────────────────────────────
@@ -215,19 +273,48 @@ def kb_wizard_summary(
     group_media: bool,
     copy_text: bool,
     continuous: bool = False,
+    accounts_label: str | None = None,
 ) -> InlineKeyboardMarkup:
     filter_btn_label = texts.BTN_FILTER_TOGGLE_ON if use_blocked_words else texts.BTN_FILTER_TOGGLE_OFF
     group_btn_label = texts.BTN_GROUP_TOGGLE_ON if group_media else texts.BTN_GROUP_TOGGLE_OFF
     text_btn_label = texts.BTN_TEXT_TOGGLE_ON if copy_text else texts.BTN_TEXT_TOGGLE_OFF
     continuous_btn_label = texts.BTN_CONTINUOUS_ON if continuous else texts.BTN_CONTINUOUS_OFF
-    return InlineKeyboardMarkup([
+    rows = [
         [_btn(texts.BTN_SAVE_DRAFT, "wzd:confirm")],
         [_btn(continuous_btn_label, "wzd:toggle_continuous")],
         [_btn(filter_btn_label, "wzd:toggle_filter")],
         [_btn(group_btn_label, "wzd:toggle_group")],
         [_btn(text_btn_label, "wzd:toggle_copy_text")],
-        [_btn(texts.BTN_CANCEL, "job:cancel_wizard")],
-    ])
+    ]
+    # Only offered when more than one account is active — with a single account
+    # there is nothing to choose.
+    if accounts_label is not None:
+        rows.append([_btn(accounts_label, "wzd:accounts")])
+    rows.append([_btn(texts.BTN_CANCEL, "job:cancel_wizard")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_wizard_userbot_list(
+    userbots: list, selected_ids: set[int] | None = None
+) -> InlineKeyboardMarkup:
+    """Multi-select of the accounts allowed to run the job. All selected = no limit."""
+    if selected_ids is None:
+        selected_ids = set()
+    rows = []
+    row: list = []
+    for ub in userbots:
+        check = "✅" if ub.id in selected_ids else "◻"
+        row.append(_btn(f"{check} {ub.display()[:30]}", f"wzd:toggle_ub:{ub.id}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([_btn(texts.BTN_WZD_ALL_ACCOUNTS, "wzd:all_ubs")])
+    if selected_ids:
+        rows.append([_btn(texts.BTN_WZD_ACCOUNTS_DONE, "wzd:done_accounts")])
+    rows.append([_btn(texts.BTN_CANCEL, "job:cancel_wizard")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ── Sources ────────────────────────────────────────────────────────────────────
@@ -452,6 +539,7 @@ def kb_settings(settings: dict[str, str]) -> InlineKeyboardMarkup:
         icon = "✅" if texts.toggle_is_on(settings, key) else "❌"
         rows.append([_btn(f"{icon} {label}", f"cfg:{key}")])
     rows.append([_btn(texts.BTN_USERBOTS, "menu:userbots")])
+    rows.append([_btn(texts.BTN_HYPER, "hyp:list")])
     rows.append([_btn(texts.BTN_MAIN_MENU, "menu:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -482,6 +570,7 @@ def kb_userbot_detail(ub) -> InlineKeyboardMarkup:
         rows.append([_btn(texts.BTN_DISABLE_USERBOT, f"ub:{ub.id}:disable")])
     else:
         rows.append([_btn(texts.BTN_ENABLE_USERBOT, f"ub:{ub.id}:enable")])
+    rows.append([_btn(texts.BTN_HYPER, f"hyp:{ub.id}:menu")])
     if not ub.is_default:
         rows.append([_btn(texts.BTN_REMOVE_USERBOT, f"ub:{ub.id}:confirm_remove")])
     rows.append([
@@ -501,6 +590,67 @@ def kb_confirm_remove_userbot(userbot_id: int) -> InlineKeyboardMarkup:
 def kb_userbot_cancel() -> InlineKeyboardMarkup:
     """Cancel button for every step of the add-account flow."""
     return InlineKeyboardMarkup([[_btn(texts.BTN_CANCEL, "ub:cancel_login")]])
+
+
+# ── Hyper backup ───────────────────────────────────────────────────────────────
+
+def kb_hyper_account_list(userbots: list, statuses: dict) -> InlineKeyboardMarkup:
+    rows = []
+    for ub in userbots:
+        icon = "🟢" if statuses.get(ub.id) else "🔴"
+        rows.append([_btn(f"{icon} {ub.display()[:40]}", f"hyp:{ub.id}:menu")])
+    rows.append([_btn(texts.BTN_BACK, "menu:settings"), _btn(texts.BTN_MAIN_MENU, "menu:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_hyper_menu(acc_id: int, cfg: dict | None, dst, filters: dict) -> InlineKeyboardMarkup:
+    enabled = bool(cfg and cfg["enabled"])
+    rows = [[_btn("🟢 כבה הייפר" if enabled else "🔴 הפעל הייפר", f"hyp:{acc_id}:toggle")]]
+    dst_label = dst.display()[:30] if dst else "בחר ערוץ גיבוי"
+    rows.append([_btn(f"📤 יעד: {dst_label}", f"hyp:{acc_id}:pickdst")])
+    for mtype in texts.HYPER_TYPES:
+        rows.append([_btn(texts.hyper_type_button(mtype, filters.get(mtype)), f"hyp:{acc_id}:type:{mtype}")])
+    rows.append([_btn(texts.BTN_BACK, "hyp:list")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_hyper_type(acc_id: int, mtype: str, rule: dict | None) -> InlineKeyboardMarkup:
+    enabled = rule is None or rule.get("enabled", True)
+    rows = [[_btn("❌ אל תגבה סוג זה" if enabled else "✅ גבה סוג זה", f"hyp:{acc_id}:ttog:{mtype}")]]
+    if enabled:
+        rows.append([
+            _btn(f"גודל מינ׳: {texts.fmt_size((rule or {}).get('min_size'))}", f"hyp:{acc_id}:set:{mtype}:minsize"),
+            _btn("🗑", f"hyp:{acc_id}:clr:{mtype}:minsize"),
+        ])
+        rows.append([
+            _btn(f"גודל מקס׳: {texts.fmt_size((rule or {}).get('max_size'))}", f"hyp:{acc_id}:set:{mtype}:maxsize"),
+            _btn("🗑", f"hyp:{acc_id}:clr:{mtype}:maxsize"),
+        ])
+        if mtype in texts.HYPER_TYPES_WITH_DURATION:
+            rows.append([
+                _btn(f"אורך מינ׳: {texts.fmt_duration((rule or {}).get('min_duration'))}", f"hyp:{acc_id}:set:{mtype}:mindur"),
+                _btn("🗑", f"hyp:{acc_id}:clr:{mtype}:mindur"),
+            ])
+            rows.append([
+                _btn(f"אורך מקס׳: {texts.fmt_duration((rule or {}).get('max_duration'))}", f"hyp:{acc_id}:set:{mtype}:maxdur"),
+                _btn("🗑", f"hyp:{acc_id}:clr:{mtype}:maxdur"),
+            ])
+        combine = (rule or {}).get("combine", "and")
+        rows.append([_btn("🔗 חיבור: וגם" if combine == "and" else "🔀 חיבור: או", f"hyp:{acc_id}:comb:{mtype}")])
+    rows.append([_btn(texts.BTN_BACK, f"hyp:{acc_id}:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_hyper_dst_picker(acc_id: int, dests: list) -> InlineKeyboardMarkup:
+    rows = []
+    for d in dests:
+        rows.append([_btn(f"📤 {d.display()[:40]}", f"hyp:{acc_id}:dst:{d.id}")])
+    rows.append([_btn(texts.BTN_BACK, f"hyp:{acc_id}:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_hyper_value_cancel(acc_id: int, mtype: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[_btn(texts.BTN_CANCEL, f"hyp:{acc_id}:type:{mtype}")]])
 
 
 # ── Generic error back button ──────────────────────────────────────────────────

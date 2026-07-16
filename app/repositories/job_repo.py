@@ -22,6 +22,7 @@ def create(
     content_types: str = DEFAULT_CONTENT_TYPES,
     created_by: Optional[int] = None,
     continuous: bool = False,
+    allowed_userbot_ids: Optional[str] = None,
 ) -> Job:
     conn = db.get_connection()
     cur = conn.execute(
@@ -29,8 +30,8 @@ def create(
            (name, source_id, destination_id, mode,
             date_from, date_to, id_from, id_to, single_message_id,
             use_blocked_words, group_media, copy_text, content_types, created_by,
-            continuous)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            continuous, allowed_userbot_ids)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             name, source_id, destination_id, mode,
             date_from, date_to, id_from, id_to, single_message_id,
@@ -40,6 +41,7 @@ def create(
             content_types,
             created_by,
             1 if continuous else 0,
+            allowed_userbot_ids,
         ),
     )
     conn.commit()
@@ -136,6 +138,14 @@ _NO_KNOWN_LACK_OF_ACCESS = (
     "OR (ca.channel_kind = 'destination' AND ca.channel_id = jobs.destination_id)))"
 )
 
+# A user-chosen allow-list: when set, only the accounts it names may claim the
+# job. NULL/empty imposes no restriction, so jobs created before this feature —
+# and any job left on "all accounts" — keep claiming exactly as before.
+_ALLOWED = (
+    "(allowed_userbot_ids IS NULL OR allowed_userbot_ids = '' "
+    "OR ',' || allowed_userbot_ids || ',' LIKE '%,' || ? || ',%')"
+)
+
 
 def claim_next_job(userbot_id: int) -> Optional[Job]:
     """
@@ -162,11 +172,12 @@ def claim_next_job(userbot_id: int) -> Optional[Job]:
               )
               AND {_NOT_EXCLUDED}
               AND {_NO_KNOWN_LACK_OF_ACCESS}
+              AND {_ALLOWED}
             ORDER BY COALESCE(continuous,0) ASC,
                      CASE status WHEN 'waiting_retry' THEN 1 ELSE 2 END,
                      COALESCE(submitted_at, created_at) ASC, id ASC
             LIMIT 1""",  # nosec B608 — fixed fragments with bound params
-        (str(userbot_id), userbot_id),
+        (str(userbot_id), userbot_id, str(userbot_id)),
     ).fetchone()
     if row is None:
         return None
@@ -204,9 +215,10 @@ def claim_continuous_job(userbot_id: int) -> Optional[Job]:
               AND status IN ('pending','running')
               AND {_NOT_EXCLUDED}
               AND {_NO_KNOWN_LACK_OF_ACCESS}
+              AND {_ALLOWED}
             ORDER BY COALESCE(submitted_at, created_at) ASC, id ASC
             LIMIT 1""",  # nosec B608 — fixed fragments with bound params
-        (str(userbot_id), userbot_id),
+        (str(userbot_id), userbot_id, str(userbot_id)),
     ).fetchone()
     if row is None:
         return None
@@ -353,6 +365,51 @@ def exclude_userbot(job_id: int, userbot_id: int) -> set[int]:
     )
     conn.commit()
     return excluded
+
+
+# Boolean columns that may be edited on a draft/paused job without touching its
+# copy progress. Whitelisted so update_flags can build SQL safely.
+_EDITABLE_FLAGS = frozenset({"use_blocked_words", "group_media", "copy_text", "continuous"})
+
+
+def update_flags(job_id: int, **flags: bool) -> None:
+    """Update one or more boolean settings on a job. Unknown keys are ignored."""
+    cols = []
+    params: list = []
+    for key, value in flags.items():
+        if key not in _EDITABLE_FLAGS:
+            continue
+        cols.append(f"{key} = ?")
+        params.append(1 if value else 0)
+    if not cols:
+        return
+    params.append(job_id)
+    conn = db.get_connection()
+    conn.execute(
+        f"UPDATE jobs SET {', '.join(cols)}, last_updated_at = datetime('now') "  # nosec B608 — cols from whitelist
+        "WHERE id = ?",
+        params,
+    )
+    conn.commit()
+
+
+def set_content_types(job_id: int, content_types: str) -> None:
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE jobs SET content_types = ?, last_updated_at = datetime('now') WHERE id = ?",
+        (content_types, job_id),
+    )
+    conn.commit()
+
+
+def set_allowed_userbots(job_id: int, allowed_userbot_ids: Optional[str]) -> None:
+    """Set (or clear, with None) the account allow-list of a job."""
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE jobs SET allowed_userbot_ids = ?, last_updated_at = datetime('now') WHERE id = ?",
+        (allowed_userbot_ids, job_id),
+    )
+    conn.commit()
 
 
 def reset_exclusions(job_id: int) -> None:
@@ -733,7 +790,18 @@ def get_daily_count_for_userbot(userbot_id: int) -> int:
            WHERE status = 'copied' AND userbot_id = ? AND processed_at >= ?""",
         (userbot_id, cutoff),
     ).fetchone()
-    return row["cnt"] if row else 0
+    bulk = row["cnt"] if row else 0
+
+    # Hyper transfers consume the same account quota but live in their own table
+    # (copied_messages can't key them). Count them together so a single cap covers
+    # all of this account's send activity.
+    hyper_row = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM hyper_transfers WHERE userbot_id = ? AND transferred_at >= ?",
+        (userbot_id, cutoff),
+    ).fetchone()
+    hyper = hyper_row["cnt"] if hyper_row else 0
+
+    return bulk + hyper
 
 
 def backfill_userbot_attribution(userbot_id: int) -> int:

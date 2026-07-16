@@ -198,6 +198,66 @@ CREATE TABLE IF NOT EXISTS channel_access (
     UNIQUE(channel_kind, channel_id, userbot_id)
 );
 
+-- Hyper backup: one config row per userbot account.
+-- Hyper is per-account by design — a listener on this account's *outgoing*
+-- messages, so it is pinned to the account whose traffic it mirrors and never
+-- migrates to another (that would back up the wrong account's uploads).
+-- Dedup is handled entirely by transferred_registry (content-based, cross-account),
+-- so hyper never touches copied_messages — whose (job_id, source_message_id) key
+-- would collide across the many different chats hyper captures from.
+CREATE TABLE IF NOT EXISTS hyper_configs (
+    userbot_id     INTEGER PRIMARY KEY,
+    enabled        INTEGER NOT NULL DEFAULT 0,
+    destination_id INTEGER,
+    copied_count   INTEGER NOT NULL DEFAULT 0,
+    skipped_count  INTEGER NOT NULL DEFAULT 0,
+    failed_count   INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- One row per successful hyper transfer, purely for the per-account daily cap.
+-- Hyper can't use copied_messages (its (job_id, source_message_id) key collides
+-- across the many chats hyper captures from), but its sends still consume the
+-- account's Telegram quota, so they must count toward the same daily limit.
+CREATE TABLE IF NOT EXISTS hyper_transfers (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    userbot_id     INTEGER NOT NULL,
+    transferred_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Smart per-account, per-media-type filter rules for hyper backup.
+-- A NULL bound means "not checked"; combine says whether the set bounds are
+-- ANDed (all must hold) or ORed (any). All-NULL bounds = pass everything.
+CREATE TABLE IF NOT EXISTS hyper_filters (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    userbot_id   INTEGER NOT NULL,
+    media_type   TEXT NOT NULL CHECK(media_type IN ('video','image','file','audio')),
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    min_size     INTEGER,   -- bytes
+    max_size     INTEGER,   -- bytes
+    min_duration INTEGER,   -- seconds
+    max_duration INTEGER,   -- seconds
+    combine      TEXT NOT NULL DEFAULT 'and' CHECK(combine IN ('and','or')),
+    UNIQUE(userbot_id, media_type)
+);
+
+-- Pending hyper backups waiting for the account to be able to send (daily cap
+-- reached, FloodWait, or a transient failure). Only (chat, message) is stored —
+-- the media stays on Telegram's servers, so the drain loop re-fetches it. This
+-- is what makes hyper a reliable backup rather than best-effort: nothing an
+-- account uploads is lost just because it was busy or capped when it arrived.
+CREATE TABLE IF NOT EXISTS hyper_queue (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    userbot_id   INTEGER NOT NULL,
+    chat_id      INTEGER NOT NULL,   -- marked peer id of the source chat
+    message_id   INTEGER NOT NULL,
+    dest_id      INTEGER NOT NULL,   -- backup destination captured at enqueue time
+    enqueued_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(userbot_id, chat_id, message_id, dest_id)
+);
+
 -- Global registry of every transferred item, keyed by content.
 -- Scope is per-destination: the same content may be sent to different channels.
 CREATE TABLE IF NOT EXISTS transferred_registry (
@@ -218,6 +278,9 @@ CREATE INDEX IF NOT EXISTS idx_copied_msg_job     ON copied_messages(job_id);
 CREATE INDEX IF NOT EXISTS idx_copied_src_id      ON copied_messages(job_id, source_message_id);
 CREATE INDEX IF NOT EXISTS idx_scan_items_media   ON duplicate_scan_items(scan_id, media_id);
 CREATE INDEX IF NOT EXISTS idx_transferred_key    ON transferred_registry(destination_id, dedup_key);
+CREATE INDEX IF NOT EXISTS idx_hyper_filters_ub    ON hyper_filters(userbot_id);
+CREATE INDEX IF NOT EXISTS idx_hyper_transfers_ub  ON hyper_transfers(userbot_id, transferred_at);
+CREATE INDEX IF NOT EXISTS idx_hyper_queue_ub      ON hyper_queue(userbot_id, id);
 CREATE INDEX IF NOT EXISTS idx_userbots_status    ON userbots(status);
 CREATE INDEX IF NOT EXISTS idx_channel_access_ch  ON channel_access(channel_kind, channel_id);
 -- NOTE: the index on copied_messages(userbot_id, ...) is created in _run_migrations,
@@ -303,6 +366,9 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "jobs",          "backfill_done",        "INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "jobs",          "assigned_userbot_id",  "INTEGER")
     _add_column_if_missing(conn, "jobs",          "excluded_userbot_ids", "TEXT")
+    # Optional positive allow-list: when set, only these accounts may run the job.
+    # NULL/empty means "any active account" — the original, unrestricted behaviour.
+    _add_column_if_missing(conn, "jobs",          "allowed_userbot_ids",  "TEXT")
     # Channel extra-info columns
     for table in ("sources", "destinations"):
         _add_column_if_missing(conn, table, "username",           "TEXT")

@@ -28,6 +28,11 @@ Thumbs.db
 mirriox.pid
 mirriox.all.pid
 
+# Logs (rotating text logs, kept ~24h back)
+logs/
+*.log
+*.log.*
+
 # Application Data & Database
 *.db
 *.sqlite

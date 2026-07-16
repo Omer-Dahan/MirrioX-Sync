@@ -7,7 +7,7 @@ from telethon import TelegramClient
 
 from app.config import load_config
 from app.models import ValidationError
-from app.repositories import job_repo, userbot_repo
+from app.repositories import job_repo, userbot_repo, hyper_repo
 from app.services import userbot_auth_service as auth
 from app.ui import renderer, texts, keyboards
 from app.ui.keyboards import to_telethon
@@ -104,6 +104,7 @@ async def _remove(userbot_id: int) -> None:
     if ub is None or ub.is_default:
         return
     _release_jobs(userbot_id)
+    hyper_repo.delete_config(userbot_id)
     userbot_repo.delete(userbot_id)
     # Best-effort: the worker's runner notices the row is gone and exits within a
     # poll cycle, so the session file may still be locked right now. A leftover

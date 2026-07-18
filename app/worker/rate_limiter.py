@@ -10,6 +10,13 @@ from collections import deque
 logger = logging.getLogger(__name__)
 
 
+class LabeledAdapter(logging.LoggerAdapter):
+    """Prefixes every log line with the owning account's label."""
+
+    def process(self, msg, kwargs):
+        return f"[{self.extra['label']}] {msg}", kwargs
+
+
 class RateLimiter:
     """
     Enforces per-message random delays and periodic batch pauses.
@@ -26,7 +33,9 @@ class RateLimiter:
         batch_size_max: int = 100,
         batch_pause_min_s: int = 60,
         batch_pause_max_s: int = 120,
+        label: str | None = None,
     ):
+        self._log = LabeledAdapter(logger, {"label": label}) if label else logger
         self.min_ms = min_ms
         self.max_ms = max_ms
         self.flood_buffer_min_s = flood_buffer_min_s
@@ -73,12 +82,12 @@ class RateLimiter:
         delay_s = random.uniform(self.min_ms / 1000.0, self.max_ms / 1000.0)  # nosec B311
         if album:
             delay_s *= 2
-            logger.debug("Album delay: %.1fs (2x normal)", delay_s)
+            self._log.debug("Album delay: %.1fs (2x normal)", delay_s)
         await asyncio.sleep(delay_s)
 
         if self._msg_count >= self._next_batch_pause_at:
             pause_s = random.uniform(self.batch_pause_min_s, self.batch_pause_max_s)  # nosec B311
-            logger.info(
+            self._log.info(
                 "Batch pause after %d messages — sleeping %.0fs before continuing",
                 self._msg_count, pause_s,
             )
@@ -90,7 +99,7 @@ class RateLimiter:
         """Sleep for the Telegram-required time plus a random jitter buffer."""
         buffer = random.uniform(self.flood_buffer_min_s, self.flood_buffer_max_s)  # nosec B311
         total = seconds + buffer
-        logger.warning(
+        self._log.warning(
             "FloodWait: sleeping %.1fs  (telegram=%ds + jitter=%.1fs)",
             total, seconds, buffer,
         )
@@ -98,7 +107,7 @@ class RateLimiter:
 
     def log_flood_wait(self, seconds: int, retry_count: int) -> None:
         """Log a FloodWait event (call before requeueing the job)."""
-        logger.warning(
+        self._log.warning(
             "FloodWait %ds received (retry #%d). Job will resume after backoff.",
             seconds, retry_count,
         )
@@ -114,7 +123,7 @@ class RateLimiter:
 
         last_hour = sum(1 for t in self._sent_timestamps if t >= hour_ago)
         last_day = len(self._sent_timestamps)
-        logger.info(
+        self._log.info(
             "Throughput: %d msgs/last-hour | %d msgs/this-session (resets on restart)",
             last_hour, last_day,
         )

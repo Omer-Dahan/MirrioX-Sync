@@ -232,7 +232,10 @@ def get_unresolved_destinations() -> list[Destination]:
 def is_destination_in_use(dest_id: int) -> bool:
     conn = db.get_connection()
     row = conn.execute(
-        "SELECT 1 FROM jobs WHERE destination_id = ? LIMIT 1", (dest_id,)
+        "SELECT 1 FROM jobs WHERE destination_id = ? "
+        "OR (destination_ids IS NOT NULL "
+        "AND ',' || destination_ids || ',' LIKE '%,' || ? || ',%') LIMIT 1",
+        (dest_id, str(dest_id)),
     ).fetchone()
     return row is not None
 

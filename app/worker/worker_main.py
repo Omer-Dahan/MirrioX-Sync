@@ -288,7 +288,10 @@ async def send_no_access_notification(
     if job is None:
         return
     src = _src_repo.get_source_by_id(job.source_id)
-    dst = _src_repo.get_destination_by_id(job.destination_id)
+    dst_str = ", ".join(
+        d.display() if (d := _src_repo.get_destination_by_id(i)) else f"#{i}"
+        for i in job.destination_id_list()
+    )
 
     def _esc(s: str) -> str:
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -297,7 +300,7 @@ async def send_no_access_notification(
         f"🚫 <b>אין גישה לערוץ</b>\n\n"
         f"📋 משימה: <b>{_esc(job.name)}</b>\n"
         f"📡 מקור: {_esc(src.display() if src else f'#{job.source_id}')}\n"
-        f"📤 יעד: {_esc(dst.display() if dst else f'#{job.destination_id}')}\n\n"
+        f"📤 יעד: {_esc(dst_str)}\n\n"
         f"נוסו {tried_accounts} חשבונות יוזרבוט — אף אחד מהם אינו חבר בערוץ.\n"
         f"הוסף אחד מהחשבונות לערוץ והפעל את המשימה מחדש."
     )
@@ -313,10 +316,12 @@ async def send_completion_notification(client: TelegramClient, job_id: int) -> N
         return
 
     src = source_repo.get_source_by_id(job.source_id)
-    dst = source_repo.get_destination_by_id(job.destination_id)
 
     src_str = src.display() if src else f"#{job.source_id}"
-    dst_str = dst.display() if dst else f"#{job.destination_id}"
+    dst_str = ", ".join(
+        d.display() if (d := source_repo.get_destination_by_id(i)) else f"#{i}"
+        for i in job.destination_id_list()
+    )
 
     def _esc(s: str) -> str:
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

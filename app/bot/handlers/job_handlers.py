@@ -55,7 +55,9 @@ async def dispatch(bot: TelegramClient, event, uid: int) -> None:
     elif data == "wzd:done_sources":
         await _wizard_done_sources(bot, uid)
     elif data.startswith("wzd:dst:"):
-        await _wizard_pick_dest(bot, uid, int(data.split(":")[2]))
+        await _wizard_toggle_dest(bot, uid, int(data.split(":")[2]))
+    elif data == "wzd:done_dests":
+        await _wizard_done_dests(bot, uid)
     elif data.startswith("wzd:mode:"):
         await _wizard_pick_mode(bot, uid, data.split(":")[2])
     elif data.startswith("wzd:toggle_type:"):
@@ -152,6 +154,10 @@ async def _dispatch_edit(bot: TelegramClient, data: str) -> None:
         await _edit_show_content_types(bot, job_id)
     elif action == "type" and param is not None:
         await _edit_toggle_type(bot, job, param)
+    elif action == "dests":
+        await _edit_show_destinations(bot, job_id)
+    elif action == "dst" and param is not None:
+        await _edit_toggle_destination(bot, job, int(param))
 
 
 async def _edit_show_menu(bot: TelegramClient, job_id: int) -> None:
@@ -185,6 +191,28 @@ async def _edit_toggle_userbot(bot: TelegramClient, job, userbot_id: int) -> Non
         value = None if current == active_ids else ",".join(str(i) for i in sorted(current))
         job_repo.set_allowed_userbots(job.id, value)
     await _edit_show_accounts(bot, job.id)
+
+
+async def _edit_show_destinations(bot: TelegramClient, job_id: int) -> None:
+    text, kb = renderer.render_job_edit_destinations(job_id)
+    await update_main_message(bot, text, to_telethon(kb))
+
+
+async def _edit_toggle_destination(bot: TelegramClient, job, dest_id: int) -> None:
+    current = job.destination_id_list()
+    if dest_id in current:
+        current = [d for d in current if d != dest_id]
+    else:
+        current = current + [dest_id]
+    # A job with no destination could never run — ignore the toggle that empties it.
+    if current:
+        try:
+            job_service.update_destinations(job.id, current)
+        except JobError as e:
+            text, kb = renderer.render_error(str(e), "jobs")
+            await update_main_message(bot, text, to_telethon(kb))
+            return
+    await _edit_show_destinations(bot, job.id)
 
 
 async def _edit_toggle_type(bot: TelegramClient, job, type_name: str) -> None:
@@ -287,7 +315,9 @@ def _init_wizard(uid: int) -> dict:
         "name": None,
         "source_ids": [],
         "source_names": [],
-        "dest_id": None,
+        "dest_ids": [],
+        "dest_names": [],
+        # Joined display string of all chosen destinations (kept for the summary texts).
         "dest_name": None,
         "mode": None,
         "date_from": None,
@@ -411,7 +441,7 @@ async def _wizard_done_sources(bot: TelegramClient, uid: int) -> None:
     await _wizard_show_dest_select(bot, w)
 
 
-async def _wizard_pick_dest(bot: TelegramClient, uid: int, dest_id: int) -> None:
+async def _wizard_toggle_dest(bot: TelegramClient, uid: int, dest_id: int) -> None:
     w = _get_wizard(uid)
     if not w:
         return
@@ -420,8 +450,23 @@ async def _wizard_pick_dest(bot: TelegramClient, uid: int, dest_id: int) -> None
         text, kb = renderer.render_error("יעד לא נמצא")
         await update_main_message(bot, text, to_telethon(kb))
         return
-    w["dest_id"] = dest.id
-    w["dest_name"] = dest.display()
+    ids: list = w.setdefault("dest_ids", [])
+    names: list = w.setdefault("dest_names", [])
+    if dest_id in ids:
+        idx = ids.index(dest_id)
+        ids.pop(idx)
+        names.pop(idx)
+    else:
+        ids.append(dest_id)
+        names.append(dest.display())
+    w["dest_name"] = ", ".join(names) or None
+    await _wizard_show_dest_select(bot, w)
+
+
+async def _wizard_done_dests(bot: TelegramClient, uid: int) -> None:
+    w = _get_wizard(uid)
+    if not w or not w.get("dest_ids"):
+        return
     w["_step"] = 4
     await _wizard_show_mode_select(bot, w)
 
@@ -462,10 +507,11 @@ async def _wizard_show_source_select(bot: TelegramClient, w: dict) -> None:
 
 async def _wizard_show_dest_select(bot: TelegramClient, w: dict) -> None:
     dests = source_repo.get_all_destinations()
+    selected = w.get("dest_ids", [])
     if not dests:
-        text, kb = renderer.render_wizard_step(texts.NO_DESTINATIONS_YET, w, keyboards.kb_wizard_dest_list([]))
+        text, kb = renderer.render_wizard_step(texts.NO_DESTINATIONS_YET, w, keyboards.kb_wizard_dest_list([], selected))
     else:
-        text, kb = renderer.render_wizard_step(texts.WIZARD_SELECT_DEST, w, keyboards.kb_wizard_dest_list(dests))
+        text, kb = renderer.render_wizard_step(texts.WIZARD_SELECT_DEST, w, keyboards.kb_wizard_dest_list(dests, selected))
     await update_main_message(bot, text, to_telethon(kb))
 
 
@@ -584,9 +630,16 @@ async def _wizard_confirm(bot: TelegramClient, uid: int) -> None:
         text, kb = renderer.render_error("לא נבחר אף מקור", "jobs")
         await update_main_message(bot, text, to_telethon(kb))
         return
+    dest_ids: list = w.get("dest_ids", [])
+    if not dest_ids:
+        text, kb = renderer.render_error("לא נבחר אף יעד", "jobs")
+        await update_main_message(bot, text, to_telethon(kb))
+        return
 
     name_base = w.get("name")
-    dst_label = (w.get("dest_name") or "יעד").split("(")[0].strip()
+    dst_label = ", ".join(
+        n.split("(")[0].strip() for n in w.get("dest_names", [])
+    )[:40] or "יעד"
 
     # Resolve the account allow-list once for every job the wizard creates.
     # A selection covering all active accounts (or the untouched default) imposes
@@ -617,7 +670,8 @@ async def _wizard_confirm(bot: TelegramClient, uid: int) -> None:
             job = job_service.create_draft_job(
                 name=job_name,
                 source_id=sid,
-                destination_id=w["dest_id"],
+                destination_id=dest_ids[0],
+                destination_ids=dest_ids,
                 mode=w["mode"],
                 date_from=w.get("date_from"),
                 date_to=w.get("date_to"),
@@ -798,10 +852,14 @@ async def handle_wzd_dest_ref(bot: TelegramClient, event, uid: int) -> None:
         dest = source_repo.add_destination(ref, ref)
         _state.get_user_data(uid).pop("awaiting_input", None)
         if w:
-            w["dest_id"] = dest.id
-            w["dest_name"] = dest.display()
-            w["_step"] = 4
-            await _wizard_show_mode_select(bot, w)
+            ids: list = w.setdefault("dest_ids", [])
+            names: list = w.setdefault("dest_names", [])
+            if dest.id not in ids:
+                ids.append(dest.id)
+                names.append(dest.display())
+            w["dest_name"] = ", ".join(names) or None
+            w["_step"] = 3
+            await _wizard_show_dest_select(bot, w)
         else:
             text, kb = renderer.render_dest_list()
             await update_main_message(bot, text, to_telethon(kb))

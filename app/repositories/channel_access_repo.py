@@ -7,6 +7,8 @@ account"; the worker fills it in on its next idle cycle.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 from app import db
 from app.models import ChannelAccessRow
 
@@ -113,6 +115,19 @@ def active_with_access(source_id: int, destination_id: int) -> set[int]:
         (source_id, destination_id),
     ).fetchall()
     return {r["userbot_id"] for r in rows}
+
+
+def active_with_access_all(source_id: int, destination_ids: list[int]) -> set[int]:
+    """Active accounts proven to reach the source and *every* destination.
+
+    A multi-destination job may route any message to any of its destinations,
+    so an account must have access to all of them to participate.
+    """
+    eligible: Optional[set[int]] = None
+    for dest_id in destination_ids:
+        s = active_with_access(source_id, dest_id)
+        eligible = s if eligible is None else eligible & s
+    return eligible or set()
 
 
 def pending_active_checks(channel_kind: str, channel_id: int) -> int:

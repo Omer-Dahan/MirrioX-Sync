@@ -27,18 +27,15 @@ def create_draft_job(
     created_by: Optional[int] = None,
     continuous: bool = False,
     allowed_userbot_ids: Optional[str] = None,
+    destination_ids: Optional[list[int]] = None,
 ) -> Job:
     """Create a job in draft state. Raises JobError on invalid input."""
     src = source_repo.get_source_by_id(source_id)
     if src is None:
         raise JobError("מקור לא קיים")
 
-    dest = source_repo.get_destination_by_id(destination_id)
-    if dest is None:
-        raise JobError("יעד לא קיים")
-
-    if src.channel_ref == dest.channel_ref:
-        raise JobError("מקור ויעד לא יכולים להיות אותו הערוץ")
+    dest_ids = destination_ids or [destination_id]
+    _validate_destinations(src, dest_ids)
 
     # `mode` and `continuous` are orthogonal: mode says which history to copy
     # first, continuous says to keep listening once that history is done.
@@ -47,7 +44,8 @@ def create_draft_job(
     return job_repo.create(
         name=name,
         source_id=source_id,
-        destination_id=destination_id,
+        destination_id=dest_ids[0],
+        destination_ids=dest_ids,
         mode=mode,
         date_from=date_from,
         date_to=date_to,
@@ -62,6 +60,24 @@ def create_draft_job(
         continuous=continuous,
         allowed_userbot_ids=allowed_userbot_ids,
     )
+
+
+def update_destinations(job_id: int, destination_ids: list[int]) -> Job:
+    """Replace a draft/paused job's destinations. Revalidates, resets access exclusions."""
+    job = _require_job(job_id)
+    if job.status not in ("draft", "paused"):
+        raise JobError("ניתן לערוך יעדים רק בטיוטה או בהשהיה")
+
+    src = source_repo.get_source_by_id(job.source_id)
+    if src is None:
+        raise JobError("מקור לא קיים")
+    _validate_destinations(src, destination_ids)
+
+    job_repo.set_destinations(job_id, destination_ids)
+    # Access facts may differ for the new destination set.
+    job_repo.reset_exclusions(job_id)
+    logger.info("Job #%d destinations set to %s", job_id, destination_ids)
+    return _require_job(job_id)
 
 
 def submit_job(job_id: int) -> Job:
@@ -117,6 +133,19 @@ def _require_job(job_id: int) -> Job:
     if job is None:
         raise JobError(f"משימה #{job_id} לא נמצאה")
     return job
+
+
+def _validate_destinations(src, destination_ids: list[int]) -> None:
+    if not destination_ids:
+        raise JobError("חייב לבחור לפחות יעד אחד")
+    if len(set(destination_ids)) != len(destination_ids):
+        raise JobError("יעד נבחר פעמיים")
+    for did in destination_ids:
+        dest = source_repo.get_destination_by_id(did)
+        if dest is None:
+            raise JobError("יעד לא קיים")
+        if src.channel_ref == dest.channel_ref:
+            raise JobError("מקור ויעד לא יכולים להיות אותו הערוץ")
 
 
 def _validate_mode_params(

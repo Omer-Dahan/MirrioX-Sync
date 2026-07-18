@@ -23,17 +23,20 @@ def create(
     created_by: Optional[int] = None,
     continuous: bool = False,
     allowed_userbot_ids: Optional[str] = None,
+    destination_ids: Optional[list[int]] = None,
 ) -> Job:
+    ids = destination_ids or [destination_id]
+    extra = ",".join(str(i) for i in ids) if len(ids) > 1 else None
     conn = db.get_connection()
     cur = conn.execute(
         """INSERT INTO jobs
            (name, source_id, destination_id, mode,
             date_from, date_to, id_from, id_to, single_message_id,
             use_blocked_words, group_media, copy_text, content_types, created_by,
-            continuous, allowed_userbot_ids)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            continuous, allowed_userbot_ids, destination_ids)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
-            name, source_id, destination_id, mode,
+            name, source_id, ids[0], mode,
             date_from, date_to, id_from, id_to, single_message_id,
             1 if use_blocked_words else 0,
             1 if group_media else 0,
@@ -42,6 +45,7 @@ def create(
             created_by,
             1 if continuous else 0,
             allowed_userbot_ids,
+            extra,
         ),
     )
     conn.commit()
@@ -135,7 +139,9 @@ _NO_KNOWN_LACK_OF_ACCESS = (
     "NOT EXISTS (SELECT 1 FROM channel_access ca "
     "WHERE ca.userbot_id = ? AND ca.has_access = 0 "
     "AND ((ca.channel_kind = 'source' AND ca.channel_id = jobs.source_id) "
-    "OR (ca.channel_kind = 'destination' AND ca.channel_id = jobs.destination_id)))"
+    "OR (ca.channel_kind = 'destination' AND (ca.channel_id = jobs.destination_id "
+    "OR (jobs.destination_ids IS NOT NULL "
+    "AND ',' || jobs.destination_ids || ',' LIKE '%,' || ca.channel_id || ',%')))))"
 )
 
 # A user-chosen allow-list: when set, only the accounts it names may claim the
@@ -408,6 +414,18 @@ def set_allowed_userbots(job_id: int, allowed_userbot_ids: Optional[str]) -> Non
     conn.execute(
         "UPDATE jobs SET allowed_userbot_ids = ?, last_updated_at = datetime('now') WHERE id = ?",
         (allowed_userbot_ids, job_id),
+    )
+    conn.commit()
+
+
+def set_destinations(job_id: int, destination_ids: list[int]) -> None:
+    """Replace the job's destination list. First id becomes the primary destination_id."""
+    value = ",".join(str(i) for i in destination_ids) if len(destination_ids) > 1 else None
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE jobs SET destination_id = ?, destination_ids = ?, "
+        "last_updated_at = datetime('now') WHERE id = ?",
+        (destination_ids[0], value, job_id),
     )
     conn.commit()
 
@@ -759,12 +777,36 @@ def get_transfer_stats() -> dict[str, int]:
             "last_24h": r["last_24h"] or 0,
         }
 
+    # Hyper transfers consume the same account quota (see
+    # get_daily_count_for_userbot) — add them so the displayed numbers match
+    # what the daily cap is actually enforced against.
+    hyper_rows = conn.execute(
+        """SELECT
+             userbot_id,
+             COUNT(CASE WHEN transferred_at >= ? THEN 1 END) AS last_hour,
+             COUNT(CASE WHEN transferred_at >= ? THEN 1 END) AS since_midnight,
+             COUNT(CASE WHEN transferred_at >= ? THEN 1 END) AS last_24h
+           FROM hyper_transfers
+           GROUP BY userbot_id""",
+        (cutoff_hour, cutoff_midnight, cutoff_24h),
+    ).fetchall()
+
+    hyper_totals = {"last_hour": 0, "since_midnight": 0, "last_24h": 0}
+    for r in hyper_rows:
+        uid = r["userbot_id"] or 0
+        stats = userbots_stats.setdefault(
+            uid, {"last_hour": 0, "since_midnight": 0, "last_24h": 0}
+        )
+        for key in hyper_totals:
+            stats[key] += r[key] or 0
+            hyper_totals[key] += r[key] or 0
+
     if not row:
-        return {"last_hour": 0, "since_midnight": 0, "last_24h": 0, "userbots": {}}
+        return {"last_hour": 0, "since_midnight": 0, "last_24h": 0, "userbots": userbots_stats}
     return {
-        "last_hour":      row["last_hour"] or 0,
-        "since_midnight": row["since_midnight"] or 0,
-        "last_24h":       row["last_24h"] or 0,
+        "last_hour":      (row["last_hour"] or 0) + hyper_totals["last_hour"],
+        "since_midnight": (row["since_midnight"] or 0) + hyper_totals["since_midnight"],
+        "last_24h":       (row["last_24h"] or 0) + hyper_totals["last_24h"],
         "userbots":       userbots_stats,
     }
 
@@ -865,6 +907,9 @@ def record_copied_message(
     userbot_id: Optional[int] = None,
 ) -> None:
     conn = db.get_connection()
+    # On conflict the row moves to the account and day of the *latest* send —
+    # a re-send is real quota-consuming activity, so that is the correct
+    # attribution for the daily counters.
     conn.execute(
         """INSERT INTO copied_messages
            (job_id, source_message_id, dest_message_id, status, skip_reason, userbot_id)

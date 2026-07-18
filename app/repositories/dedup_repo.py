@@ -128,6 +128,28 @@ def is_duplicate(msg, destination_id: int) -> bool:
     return exists(destination_id, computed[1])
 
 
+def exists_any(destination_ids: list[int], dedup_key: str) -> bool:
+    """True if this key was already sent to any of the given destinations."""
+    if not destination_ids:
+        return False
+    conn = db.get_connection()
+    placeholders = ",".join("?" * len(destination_ids))
+    row = conn.execute(
+        "SELECT 1 FROM transferred_registry "  # nosec B608 — generated placeholders only
+        f"WHERE destination_id IN ({placeholders}) AND dedup_key = ? LIMIT 1",
+        [*destination_ids, dedup_key],
+    ).fetchone()
+    return row is not None
+
+
+def is_duplicate_any(msg, destination_ids: list[int]) -> bool:
+    """True if this message's content already reached any of a job's destinations."""
+    computed = compute_key(msg)
+    if computed is None:
+        return False
+    return exists_any(destination_ids, computed[1])
+
+
 def count_for_destination(destination_id: int) -> int:
     conn = db.get_connection()
     row = conn.execute(

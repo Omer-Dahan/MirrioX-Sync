@@ -194,6 +194,7 @@ class Job:
     assigned_userbot_id: Optional[int] = None
     excluded_userbot_ids: Optional[str] = None
     allowed_userbot_ids: Optional[str] = None
+    destination_ids: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Job":
@@ -235,6 +236,7 @@ class Job:
             assigned_userbot_id=row["assigned_userbot_id"] if "assigned_userbot_id" in keys else None,
             excluded_userbot_ids=row["excluded_userbot_ids"] if "excluded_userbot_ids" in keys else None,
             allowed_userbot_ids=row["allowed_userbot_ids"] if "allowed_userbot_ids" in keys else None,
+            destination_ids=row["destination_ids"] if "destination_ids" in keys else None,
         )
 
     def is_active(self) -> bool:
@@ -242,6 +244,18 @@ class Job:
 
     def is_terminal(self) -> bool:
         return self.status in ("completed", "cancelled", "failed")
+
+    def destination_id_list(self) -> list[int]:
+        """All destination ids of this job, primary first; order-preserving.
+
+        Falls back to the single legacy destination_id column when the list
+        column is NULL/empty, so pre-existing jobs behave exactly as before.
+        """
+        if self.destination_ids:
+            ids = [int(p) for p in self.destination_ids.split(",") if p.strip()]
+            if ids:
+                return ids
+        return [self.destination_id]
 
     def excluded_ids(self) -> set[int]:
         """Userbot IDs that already failed this job for lack of channel access."""

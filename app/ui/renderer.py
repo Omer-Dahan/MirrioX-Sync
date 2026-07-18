@@ -37,9 +37,9 @@ def render_job_detail(job_id: int) -> tuple[str, InlineKeyboardMarkup]:
     if job is None:
         return texts.error_text(f"משימה #{job_id} לא נמצאה"), keyboards.kb_error_back("jobs")
     src = source_repo.get_source_by_id(job.source_id)
-    dst = source_repo.get_destination_by_id(job.destination_id)
+    dsts = [source_repo.get_destination_by_id(i) for i in job.destination_id_list()]
     queue_pos = job_repo.get_queue_position(job_id) if job.status == "pending" else None
-    return texts.job_detail_text(job, src, dst, queue_pos), keyboards.kb_job_detail(job)
+    return texts.job_detail_text(job, src, dsts, queue_pos), keyboards.kb_job_detail(job)
 
 
 def render_job_edit(job_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -67,6 +67,19 @@ def render_job_edit_accounts(job_id: int) -> tuple[str, InlineKeyboardMarkup]:
     return (
         texts.job_edit_accounts_text(job),
         keyboards.kb_job_edit_userbots(job_id, active, selected),
+    )
+
+
+def render_job_edit_destinations(job_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    from app.repositories import job_repo
+    job = job_repo.get_by_id(job_id)
+    if job is None:
+        return texts.error_text(f"משימה #{job_id} לא נמצאה"), keyboards.kb_error_back("jobs")
+    dests = source_repo.get_all_destinations()
+    selected = set(job.destination_id_list())
+    return (
+        texts.job_edit_destinations_text(job),
+        keyboards.kb_job_edit_dest_list(job_id, dests, selected),
     )
 
 

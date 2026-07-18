@@ -149,6 +149,7 @@ class UserbotRunner:
             self.client,
             resolve_callback=self._resolve_if_needed,
             userbot_id=self.userbot.id,
+            label=self.label,
         )
         logger.info("Userbot %s: connected%s", self.label, " [primary]" if self.is_primary else "")
         return True

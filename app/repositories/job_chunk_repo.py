@@ -29,7 +29,10 @@ _CLAIMABLE_JOB = """
                      WHERE ca.userbot_id = ? AND ca.has_access = 0
                        AND ((ca.channel_kind = 'source' AND ca.channel_id = j.source_id)
                          OR (ca.channel_kind = 'destination'
-                             AND ca.channel_id = j.destination_id)))
+                             AND (ca.channel_id = j.destination_id
+                               OR (j.destination_ids IS NOT NULL
+                                   AND ',' || j.destination_ids || ','
+                                       LIKE '%,' || ca.channel_id || ',%')))))
     AND (j.allowed_userbot_ids IS NULL OR j.allowed_userbot_ids = ''
          OR ',' || j.allowed_userbot_ids || ',' LIKE '%,' || ? || ',%')
 """

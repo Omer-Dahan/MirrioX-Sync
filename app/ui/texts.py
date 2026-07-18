@@ -106,6 +106,7 @@ BTN_PAUSE_JOB       = "⏸ השהה משימה"
 BTN_RESUME_JOB      = "▶️ המשך משימה"
 BTN_EDIT_JOB        = "✏️ ערוך משימה"
 BTN_EDIT_CONTENT_TYPES = "📁 סוגי תוכן"
+BTN_EDIT_DESTS      = "🎯 ערוך יעדים"
 BTN_RESET_EXCLUSIONS = "🔄 אפס חסימות גישה"
 BTN_EDIT_ACCOUNTS   = "🤖 חשבונות מריצים"
 BTN_CANCEL_JOB      = "⏹ בטל משימה"
@@ -337,11 +338,15 @@ def scan_row_text(scan: dict) -> str:
 def job_detail_text(
     job: "Job",
     source: "Source | None",
-    dest: "Destination | None",
+    dests: "list[Destination | None]",
     queue_position: "int | None" = None,
 ) -> str:
     src_str = source.display() if source else f"[#{job.source_id}]"
-    dst_str = dest.display() if dest else f"[#{job.destination_id}]"
+    dst_str = ", ".join(
+        d.display() if d else f"[#{i}]"
+        for i, d in zip(job.destination_id_list(), dests)
+    )
+    dst_label = "יעד" if len(dests) <= 1 else "יעדים (אקראי)"
     status_label = job_status_label(job)
     mode_label = MODE_LABELS.get(job.mode, job.mode)
 
@@ -407,7 +412,7 @@ def job_detail_text(
         f"מזהה: {job.id}\n"
         f"\n"
         f"מקור: {esc(src_str)}\n"
-        f"יעד: {esc(dst_str)}\n"
+        f"{dst_label}: {esc(dst_str)}\n"
         f"מצב: {mode_label}{params_line}\n"
         f"תוכן: {ct_str}\n"
         f"סינון מילים: {filter_str}\n"
@@ -636,7 +641,7 @@ def job_edit_text(job: "Job", word_count: int, accounts_str: str) -> str:
         f"📦 שליחה במרוכז: {group_status}\n"
         f"📝 העתקת טקסט: {text_status}\n"
         f"🔄 סנכרון רציף: {continuous_status}\n\n"
-        f"<i>מקור/יעד/מצב/טווח אינם ניתנים לשינוי — כדי לשמר את נקודת ההמשך "
+        f"<i>מקור/מצב/טווח אינם ניתנים לשינוי — כדי לשמר את נקודת ההמשך "
         f"וההיסטוריה. לאחר העריכה לחץ 'המשך משימה' כדי להמשיך מהמקום שנעצר.</i>"
     )
 
@@ -647,6 +652,17 @@ def job_edit_accounts_text(job: "Job") -> str:
         f"{TITLE_EDIT_JOB}\n\n"
         f"📋 <b>{esc(job.name)}</b>\n\n"
         f"{WIZARD_SELECT_ACCOUNTS}"
+    )
+
+
+def job_edit_destinations_text(job: "Job") -> str:
+    """The destination picker, in the edit context."""
+    return (
+        f"{TITLE_EDIT_JOB}\n\n"
+        f"📋 <b>{esc(job.name)}</b>\n\n"
+        "בחר את ערוצי היעד של המשימה:\n"
+        "<i>כשנבחרים כמה יעדים, כל הודעה נשלחת לאחד מהם באקראי "
+        "(אלבום נשלח שלם לאותו יעד). חסימת כפילויות נאכפת מול כל היעדים יחד.</i>"
     )
 
 

@@ -36,7 +36,7 @@ from telethon.tl.types import (
 
 from app.models import ALL_CONTENT_TYPES, DEFAULT_CONTENT_TYPES, Job, JobChunk, NoAccessError
 from app.repositories import job_repo, job_chunk_repo, filter_repo, source_repo, dedup_repo
-from app.worker.rate_limiter import RateLimiter
+from app.worker.rate_limiter import LabeledAdapter, RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +60,10 @@ _LEADER_WAIT_S = 5
 class _JobContext:
     """Everything a copy pass needs that is resolved once per job, not per chunk."""
     src_rec: object
-    dst_rec: object
     src_entity: object
-    dst_entity: object
+    # (destination_id, resolved entity) per destination — one entry for a classic
+    # single-destination job, several for random fan-out.
+    dst_targets: list
     blocked_words: list[str]
     skip_duplicates: bool
     # Learned the first time a forward is refused, then honoured for the rest of
@@ -111,11 +112,13 @@ class CopyEngine:
         client: TelegramClient,
         resolve_callback: Optional[Callable[[], Awaitable[None]]] = None,
         userbot_id: Optional[int] = None,
+        label: Optional[str] = None,
     ) -> None:
         self._client = client
-        self._rate_limiter = RateLimiter()
+        self._rate_limiter = RateLimiter(label=label)
         self._resolve_callback = resolve_callback
         self._userbot_id = userbot_id
+        self._log = LabeledAdapter(logger, {"label": label}) if label else logger
 
     # ── Entry points ───────────────────────────────────────────────────────────
 
@@ -193,7 +196,7 @@ class CopyEngine:
                 break
             if job_repo.should_stop(job.id):
                 return
-            logger.info(
+            self._log.info(
                 "Job #%d: no free chunks — waiting for %d still with other account(s)",
                 job.id, left,
             )
@@ -230,7 +233,7 @@ class CopyEngine:
             return False  # too small to be worth splitting
 
         job_chunk_repo.plan(job.id, ranges)
-        logger.info(
+        self._log.info(
             "Job #%d: %d accounts can reach both channels — sharded ids %d–%d into "
             "%d chunk(s) of ~%d ids each",
             job.id, len(eligible), lo, hi, len(ranges), size,
@@ -242,7 +245,9 @@ class CopyEngine:
         from app.repositories import channel_access_repo, userbot_repo
 
         active = {u.id for u in userbot_repo.get_active()}
-        with_access = channel_access_repo.active_with_access(job.source_id, job.destination_id)
+        with_access = channel_access_repo.active_with_access_all(
+            job.source_id, job.destination_id_list()
+        )
         # This account resolved both channels a moment ago, so it plainly has
         # access even if its own probe hasn't been recorded yet.
         if self._userbot_id is not None:
@@ -284,11 +289,11 @@ class CopyEngine:
         blocked_words: list[str] = []
         if job.use_blocked_words:
             blocked_words = filter_repo.get_word_strings()
-            logger.info("Job #%d: %d blocked words loaded", job.id, len(blocked_words))
+            self._log.info("Job #%d: %d blocked words loaded", job.id, len(blocked_words))
 
         src_rec = source_repo.get_source_by_id(job.source_id)
-        dst_rec = source_repo.get_destination_by_id(job.destination_id)
-        if not src_rec or not dst_rec:
+        dst_recs = [source_repo.get_destination_by_id(d) for d in job.destination_id_list()]
+        if not src_rec or any(r is None for r in dst_recs):
             job_repo.update_status(job.id, "failed", error="מקור או יעד לא נמצאו")
             return None
 
@@ -297,13 +302,18 @@ class CopyEngine:
             src_entity = await get_entity_safe(
                 self._client, str(src_rec.resolved_id or src_rec.channel_ref)
             )
-            dst_entity = await get_entity_safe(
-                self._client, str(dst_rec.resolved_id or dst_rec.channel_ref)
-            )
+            # Every destination must resolve: any message may be routed to any of
+            # them, so failing one means this account cannot run the job at all.
+            dst_targets: list[tuple[int, object]] = []
+            for dst_rec in dst_recs:
+                dst_entity = await get_entity_safe(
+                    self._client, str(dst_rec.resolved_id or dst_rec.channel_ref)
+                )
+                dst_targets.append((dst_rec.id, dst_entity))
         except (ChannelPrivateError, ValueError) as e:
             # This account cannot see the channel. Let the worker offer the job to
             # another userbot instead of failing it outright.
-            logger.warning(
+            self._log.warning(
                 "Job #%d: userbot %s has no access (%s) — requesting reassignment",
                 job.id, self._userbot_id, e,
             )
@@ -320,21 +330,21 @@ class CopyEngine:
             except Exception:  # nosec B110 — best-effort cache update, non-fatal
                 pass
 
-        if not dst_rec.resolved_id:
-            try:
-                source_repo.update_destination_resolved(
-                    dst_rec.id,
-                    getattr(dst_entity, "title", dst_rec.channel_ref),
-                    dst_entity.id,
-                )
-            except Exception:  # nosec B110 — best-effort cache update, non-fatal
-                pass
+        for dst_rec, (_, dst_entity) in zip(dst_recs, dst_targets):
+            if not dst_rec.resolved_id:
+                try:
+                    source_repo.update_destination_resolved(
+                        dst_rec.id,
+                        getattr(dst_entity, "title", dst_rec.channel_ref),
+                        dst_entity.id,
+                    )
+                except Exception:  # nosec B110 — best-effort cache update, non-fatal
+                    pass
 
         return _JobContext(
             src_rec=src_rec,
-            dst_rec=dst_rec,
             src_entity=src_entity,
-            dst_entity=dst_entity,
+            dst_targets=dst_targets,
             blocked_words=blocked_words,
             skip_duplicates=settings.get("skip_duplicates", "0") == "1",
         )
@@ -345,7 +355,7 @@ class CopyEngine:
         # terminal state over 'cancelled' — that silently undid the cancel and left
         # the job looking like it had completed normally.
         if job_repo.should_stop(job.id):
-            logger.info("Job #%d: stopped by user at end of run", job.id)
+            self._log.info("Job #%d: stopped by user at end of run", job.id)
             return
 
         fresh = job_repo.get_by_id(job.id) or job
@@ -354,14 +364,14 @@ class CopyEngine:
             # to listening for new messages. The worker picks it up as a listener
             # on its next reconcile.
             job_repo.mark_backfill_done(job.id)
-            logger.info(
+            self._log.info(
                 "Job #%d: history copy finished (copied=%d skipped=%d failed=%d) "
                 "— switching to live listening",
                 job.id, fresh.copied_count, fresh.skipped_count, fresh.failed_count,
             )
         else:
             job_repo.mark_completed(job.id)
-            logger.info(
+            self._log.info(
                 "Job #%d completed: copied=%d skipped=%d failed=%d",
                 job.id, fresh.copied_count, fresh.skipped_count, fresh.failed_count,
             )
@@ -369,7 +379,7 @@ class CopyEngine:
         # Generate Telegraph report for notable (failed / unexpected-skipped) messages
         report_msgs = job_repo.get_report_messages(job.id)
         if not report_msgs:
-            logger.info("Job #%d: no notable messages — Telegraph report skipped", job.id)
+            self._log.info("Job #%d: no notable messages — Telegraph report skipped", job.id)
             return
         from app.services import telegraph_service
         url = await telegraph_service.create_report(
@@ -377,7 +387,7 @@ class CopyEngine:
         )
         if url:
             job_repo.save_report_url(job.id, url)
-            logger.info("Job #%d Telegraph report: %s", job.id, url)
+            self._log.info("Job #%d Telegraph report: %s", job.id, url)
 
     # ── One copy pass ──────────────────────────────────────────────────────────
 
@@ -396,19 +406,20 @@ class CopyEngine:
         skip_duplicates: bool = ctx.skip_duplicates
         blocked_words: list[str] = ctx.blocked_words
         src_entity = ctx.src_entity
-        dst_entity = ctx.dst_entity
+        dst_targets = ctx.dst_targets
+        dest_ids = [d for d, _ in dst_targets]
 
         # Only this range's history is relevant; loading a big job's whole record
         # for every chunk would be waste.
         if chunk is None:
             already_done: set[int] = job_repo.get_copied_source_ids(job.id)
-            logger.info(
+            self._log.info(
                 "Job #%d: resuming — %d already done, checkpoint=#%s",
                 job.id, len(already_done), job.last_processed_id,
             )
         else:
             already_done = job_repo.get_copied_source_ids(job.id, chunk.id_from, chunk.id_to)
-            logger.info(
+            self._log.info(
                 "Job #%d chunk #%d (ids %d–%d): %d already done, checkpoint=#%s",
                 job.id, chunk.id, chunk.id_from, chunk.id_to,
                 len(already_done), chunk.last_processed_id,
@@ -463,7 +474,7 @@ class CopyEngine:
                         already_done.add(m.id)
                         p.skipped += 1
                         continue
-                if skip_duplicates and dedup_repo.is_duplicate(m, job.destination_id):
+                if skip_duplicates and dedup_repo.is_duplicate_any(m, dest_ids):
                     job_repo.record_copied_message(job.id, m.id, None, "skipped", "duplicate", userbot_id=self._userbot_id)
                     already_done.add(m.id)
                     p.skipped += 1
@@ -473,6 +484,10 @@ class CopyEngine:
             if not to_send:
                 p.flush(checkpoint)
                 return False
+
+            # One random destination per synthetic album — the whole batch (and
+            # any individual fallback send) must land in a single channel.
+            dest_id, dst_entity = random.choice(dst_targets)  # nosec B311
 
             async def _send_single(m: Message) -> tuple[str, str | None]:
                 """Forward one message; returns (status, reason). Updates ctx.src_is_protected."""
@@ -509,7 +524,7 @@ class CopyEngine:
                 st, reason = await _send_single(to_send[0])
                 if st == "copied":
                     p.copied += 1
-                    self._record_transfer(job, to_send[0])
+                    self._record_transfer(job, to_send[0], dest_id)
                 else:
                     p.failed += 1
                 job_repo.record_copied_message(job.id, to_send[0].id, None, st, reason, userbot_id=self._userbot_id)
@@ -520,14 +535,14 @@ class CopyEngine:
                 try:
                     await self._send_group_by_ref(to_send, dst_entity, copy_text=job.copy_text)
                     album_ok = True
-                    logger.info(
+                    self._log.info(
                         "Job #%d: grouped %d solo media into album (ids=%s)",
                         job.id, len(to_send), [m.id for m in to_send],
                     )
                 except FloodWaitError:
                     raise
                 except Exception as ref_err:
-                    logger.warning(
+                    self._log.warning(
                         "Job #%d: album ref-send failed (%s) — falling back to %d individual sends",
                         job.id, ref_err, len(to_send),
                     )
@@ -535,7 +550,7 @@ class CopyEngine:
                 if album_ok:
                     for m in to_send:
                         job_repo.record_copied_message(job.id, m.id, None, "copied", None, userbot_id=self._userbot_id)
-                        self._record_transfer(job, m)
+                        self._record_transfer(job, m, dest_id)
                         already_done.add(m.id)
                         p.copied += 1
                 else:
@@ -545,10 +560,10 @@ class CopyEngine:
                     st, reason = await _send_single(first)
                     if st == "copied":
                         p.copied += 1
-                        self._record_transfer(job, first)
+                        self._record_transfer(job, first, dest_id)
                     else:
                         p.failed += 1
-                        logger.warning(
+                        self._log.warning(
                             "Job #%d: failed to send msg #%d individually: %s",
                             job.id, first.id, reason,
                         )
@@ -558,7 +573,7 @@ class CopyEngine:
                     # Re-queue the remaining messages for the next album attempt
                     if len(to_send) > 1:
                         remaining = to_send[1:]
-                        logger.info(
+                        self._log.info(
                             "Job #%d: re-queuing %d messages back to solo buffer after album failure",
                             job.id, len(remaining),
                         )
@@ -573,7 +588,7 @@ class CopyEngine:
 
             p.flush(checkpoint)
             if job_repo.should_stop(job.id):
-                logger.info("Job #%d: stop requested (paused/cancelled) after media flush at #%d", job.id, checkpoint)
+                self._log.info("Job #%d: stop requested (paused/cancelled) after media flush at #%d", job.id, checkpoint)
                 return True
             await self._rate_limiter.wait(album=True)
             return False
@@ -597,6 +612,8 @@ class CopyEngine:
             if not pending:
                 return False
 
+            # An existing album is forwarded whole to one random destination.
+            dest_id, dst_entity = random.choice(dst_targets)  # nosec B311
             statuses, ctx.src_is_protected = await self._process_group(
                 job, pending, blocked_words, src_entity, dst_entity, ctx.src_is_protected,
                 skip_duplicates=skip_duplicates,
@@ -617,7 +634,7 @@ class CopyEngine:
                 already_done.add(msg.id)
                 if status == "copied":
                     p.copied += 1
-                    self._record_transfer(job, msg)
+                    self._record_transfer(job, msg, dest_id)
                 elif status == "skipped":
                     p.skipped += 1
                 else:
@@ -625,9 +642,11 @@ class CopyEngine:
 
             p.flush(last_id)
             if job_repo.should_stop(job.id):
-                logger.info("Job #%d: stop requested (paused/cancelled) after album flush at #%d", job.id, last_id)
+                self._log.info("Job #%d: stop requested (paused/cancelled) after album flush at #%d", job.id, last_id)
                 return True
-            await self._rate_limiter.wait(album=True)
+            # A fully skipped album sent nothing — pay no delay for it.
+            if any(status == "copied" for status, _ in statuses):
+                await self._rate_limiter.wait(album=True)
             return False
 
         try:
@@ -668,6 +687,7 @@ class CopyEngine:
                         if msg.id in already_done:
                             continue
 
+                        dest_id, dst_entity = random.choice(dst_targets)  # nosec B311
                         status, skip_reason, ctx.src_is_protected = await self._process_message(
                             job, msg, blocked_words, src_entity, dst_entity, ctx.src_is_protected,
                             skip_duplicates=skip_duplicates,
@@ -685,7 +705,7 @@ class CopyEngine:
 
                         if status == "copied":
                             p.copied += 1
-                            self._record_transfer(job, msg)
+                            self._record_transfer(job, msg, dest_id)
                         elif status == "skipped":
                             p.skipped += 1
                         else:
@@ -694,7 +714,7 @@ class CopyEngine:
                         p.flush(msg.id)
                         if p.copied - _last_progress_log >= 50:
                             _last_progress_log = p.copied
-                            logger.info(
+                            self._log.info(
                                 "Job #%d progress: copied=%d skipped=%d failed=%d last_id=#%d",
                                 job.id, p.copied, p.skipped, p.failed, msg.id,
                             )
@@ -703,7 +723,7 @@ class CopyEngine:
                         # rate-limiter sleep between sends — and it makes cancel
                         # take effect on the next message instead of 25 later.
                         if job_repo.should_stop(job.id):
-                            logger.info("Job #%d: stop requested (paused/cancelled) — stopping at msg #%d", job.id, msg.id)
+                            self._log.info("Job #%d: stop requested (paused/cancelled) — stopping at msg #%d", job.id, msg.id)
                             return "stopped"
 
                         _msgs_since_pause_check += 1
@@ -725,14 +745,20 @@ class CopyEngine:
                             # park_queue_if_all_capped.
                             count_today = job_repo.get_daily_count_for_userbot(self._userbot_id)
                             if count_today >= DAILY_LIMIT:
-                                logger.warning(
+                                self._log.warning(
                                     "Job #%d: userbot #%d hit its daily limit mid-run (%d msgs) — "
                                     "releasing at msg #%d for another account",
                                     job.id, self._userbot_id, count_today, msg.id,
                                 )
                                 return "capped"
 
-                        await self._rate_limiter.wait()
+                        # Skipped messages sent nothing to Telegram — pay no delay
+                        # and don't advance the batch-pause counter for them.
+                        if status == "copied":
+                            await self._rate_limiter.wait()
+                        elif status == "failed":
+                            # A failed send still hit the network — brief fixed pause.
+                            await asyncio.sleep(1.0)
 
             # Flush any remaining buffers at end of stream
             if await flush_group():
@@ -743,20 +769,20 @@ class CopyEngine:
                         return "stopped"
 
         except FloodWaitError:
-            logger.warning("Job #%d: FloodWait encountered", job.id)
+            self._log.warning("Job #%d: FloodWait encountered", job.id)
             raise
 
         except (ChatWriteForbiddenError, ChannelPrivateError) as e:
             # Access lost mid-run. Progress is checkpointed, so another userbot
             # can pick this up and resume from where this one stopped.
-            logger.warning(
+            self._log.warning(
                 "Job #%d: userbot %s lost access mid-run (%s) — requesting reassignment",
                 job.id, self._userbot_id, e,
             )
             raise NoAccessError(f"אין הרשאת גישה/כתיבה לערוץ: {e}") from e
 
         except Exception as e:
-            logger.exception("Job #%d: unexpected error: %s", job.id, e)
+            self._log.exception("Job #%d: unexpected error: %s", job.id, e)
             raise
 
         return "completed"
@@ -863,7 +889,7 @@ class CopyEngine:
         """
         # Global block word checks
         if blocked_words and any(self._is_blocked(m, blocked_words) for m in group):
-            logger.debug("Job #%d: group %d blocked by filter", job.id, group[0].grouped_id)
+            self._log.debug("Job #%d: group %d blocked by filter", job.id, group[0].grouped_id)
             return [("skipped", "blocked_word")] * len(group), src_is_protected
 
         allowed_types: set[str] = set((job.content_types or DEFAULT_CONTENT_TYPES).split(","))
@@ -883,7 +909,7 @@ class CopyEngine:
                     final_statuses.append(("skipped", f"content_type:{msg_type}"))
                     continue
 
-            if skip_duplicates and dedup_repo.is_duplicate(m, job.destination_id):
+            if skip_duplicates and dedup_repo.is_duplicate_any(m, job.destination_id_list()):
                 final_statuses.append(("skipped", "duplicate"))
                 continue
 
@@ -891,7 +917,7 @@ class CopyEngine:
             send_group.append(m)
 
         if not send_group:
-            logger.debug("Job #%d: album group=%s all items skipped", job.id, group[0].grouped_id)
+            self._log.debug("Job #%d: album group=%s all items skipped", job.id, group[0].grouped_id)
             return [st for st in final_statuses if st is not None], src_is_protected
 
         def fill_statuses(st_tuple):
@@ -911,7 +937,7 @@ class CopyEngine:
             except FloodWaitError:
                 raise
             except Exception as e:
-                logger.warning("Job #%d: download+upload album failed: %s", job.id, e)
+                self._log.warning("Job #%d: download+upload album failed: %s", job.id, e)
                 return fill_statuses(("failed", str(e)[:200])), src_is_protected
 
         ids = [m.id for m in send_group]
@@ -929,7 +955,7 @@ class CopyEngine:
                 # the file references first and falls back to download+reupload for
                 # items the album API cannot carry (plain docs, GIFs, round notes).
                 await self._send_group_as_copy(send_group, dst_entity, copy_text=False)
-            logger.info(
+            self._log.info(
                 "Job #%d: forwarded album of %d items (ids=%s)",
                 job.id, len(ids), ids,
             )
@@ -937,7 +963,7 @@ class CopyEngine:
 
         except ChatForwardsRestrictedError:
             src_is_protected = True
-            logger.info(
+            self._log.info(
                 "Job #%d: source channel is protected — switching to download+upload for all remaining messages",
                 job.id,
             )
@@ -947,14 +973,14 @@ class CopyEngine:
             except FloodWaitError:
                 raise
             except Exception as e:
-                logger.warning("Job #%d: download+upload album failed: %s", job.id, e)
+                self._log.warning("Job #%d: download+upload album failed: %s", job.id, e)
                 return fill_statuses(("failed", str(e)[:200])), src_is_protected
 
         except FloodWaitError:
             raise
 
         except Exception as e:
-            logger.warning(
+            self._log.warning(
                 "Job #%d: failed to forward album (ids=%s): %s",
                 job.id, ids, e,
             )
@@ -974,12 +1000,12 @@ class CopyEngine:
 
         # Filter check
         if blocked_words and self._is_blocked(msg, blocked_words):
-            logger.debug("Job #%d: msg #%d blocked by filter", job.id, msg.id)
+            self._log.debug("Job #%d: msg #%d blocked by filter", job.id, msg.id)
             return "skipped", "blocked_word", src_is_protected
 
-        # Already sent this exact content to this destination
-        if skip_duplicates and dedup_repo.is_duplicate(msg, job.destination_id):
-            logger.debug("Job #%d: msg #%d skipped as duplicate", job.id, msg.id)
+        # Already sent this exact content to any of the job's destinations
+        if skip_duplicates and dedup_repo.is_duplicate_any(msg, job.destination_id_list()):
+            self._log.debug("Job #%d: msg #%d skipped as duplicate", job.id, msg.id)
             return "skipped", "duplicate", src_is_protected
 
         # Content type filter
@@ -987,12 +1013,12 @@ class CopyEngine:
         if allowed_types != ALL_CONTENT_TYPES:
             msg_type = self._get_content_type(msg)
             if msg_type not in allowed_types:
-                logger.debug("Job #%d: msg #%d skipped (type=%s not in %s)", job.id, msg.id, msg_type, allowed_types)
+                self._log.debug("Job #%d: msg #%d skipped (type=%s not in %s)", job.id, msg.id, msg_type, allowed_types)
                 return "skipped", f"content_type:{msg_type}", src_is_protected
 
         # Supported type check
         if not self._is_supported_type(msg):
-            logger.debug("Job #%d: msg #%d unsupported type", job.id, msg.id)
+            self._log.debug("Job #%d: msg #%d unsupported type", job.id, msg.id)
             return "skipped", "unsupported_type", src_is_protected
 
         # Skip empty service messages
@@ -1010,7 +1036,7 @@ class CopyEngine:
             except FloodWaitError:
                 raise
             except Exception as e:
-                logger.warning("Job #%d: failed to copy msg #%d: %s", job.id, msg.id, e)
+                self._log.warning("Job #%d: failed to copy msg #%d: %s", job.id, msg.id, e)
                 return "failed", str(e)[:200], src_is_protected
 
         try:
@@ -1028,7 +1054,7 @@ class CopyEngine:
 
         except ChatForwardsRestrictedError:
             src_is_protected = True
-            logger.info(
+            self._log.info(
                 "Job #%d: source channel is protected — switching to download+upload for all remaining messages",
                 job.id,
             )
@@ -1038,21 +1064,21 @@ class CopyEngine:
             except FloodWaitError:
                 raise
             except Exception as e:
-                logger.warning("Job #%d: failed to copy msg #%d: %s", job.id, msg.id, e)
+                self._log.warning("Job #%d: failed to copy msg #%d: %s", job.id, msg.id, e)
                 return "failed", str(e)[:200], src_is_protected
 
         except FloodWaitError:
             raise
 
         except Exception as e:
-            logger.warning("Job #%d: failed to copy msg #%d: %s", job.id, msg.id, e)
+            self._log.warning("Job #%d: failed to copy msg #%d: %s", job.id, msg.id, e)
             return "failed", str(e)[:200], src_is_protected
 
-    def _record_transfer(self, job: Job, msg: Message) -> None:
+    def _record_transfer(self, job: Job, msg: Message, destination_id: int) -> None:
         """Add a successfully transferred message to the global dedup registry."""
         dedup_repo.record_message(
             msg,
-            destination_id=job.destination_id,
+            destination_id=destination_id,
             source_id=job.source_id,
             job_id=job.id,
         )
@@ -1084,8 +1110,8 @@ class CopyEngine:
         blocked_words: list[str] = filter_repo.get_word_strings() if job.use_blocked_words else []
 
         src_rec = source_repo.get_source_by_id(job.source_id)
-        dst_rec = source_repo.get_destination_by_id(job.destination_id)
-        if not src_rec or not dst_rec:
+        dst_recs = [source_repo.get_destination_by_id(d) for d in job.destination_id_list()]
+        if not src_rec or any(r is None for r in dst_recs):
             return "failed"
 
         from app.worker.telegram_utils import get_entity_safe
@@ -1093,11 +1119,15 @@ class CopyEngine:
             src_entity = await get_entity_safe(
                 self._client, str(src_rec.resolved_id or src_rec.channel_ref)
             )
-            dst_entity = await get_entity_safe(
-                self._client, str(dst_rec.resolved_id or dst_rec.channel_ref)
-            )
+            dst_targets: list[tuple[int, object]] = []
+            for dst_rec in dst_recs:
+                dst_targets.append((dst_rec.id, await get_entity_safe(
+                    self._client, str(dst_rec.resolved_id or dst_rec.channel_ref)
+                )))
         except (ChannelPrivateError, ValueError) as e:
             raise NoAccessError(f"אין גישה לערוץ: {e}") from e
+
+        dest_id, dst_entity = random.choice(dst_targets)  # nosec B311
 
         status, skip_reason, _ = await self._process_message(
             job, msg, blocked_words, src_entity, dst_entity, False,
@@ -1115,10 +1145,10 @@ class CopyEngine:
         )
 
         if status == "copied":
-            self._record_transfer(job, msg)
+            self._record_transfer(job, msg, dest_id)
             await self._rate_limiter.wait()
 
-        logger.info(
+        self._log.info(
             "Job #%d (continuous): live msg #%d → %s%s",
             job.id, msg.id, status, f" ({skip_reason})" if skip_reason else "",
         )
@@ -1158,14 +1188,14 @@ class CopyEngine:
         size, duration = hyper_filter.extract_size_duration(msg)
         passes, reason = hyper_filter.evaluate(media_type, size, duration, rules)
         if not passes:
-            logger.debug("Hyper: msg #%s skipped by filter (%s/%s)", msg.id, media_type, reason)
+            self._log.debug("Hyper: msg #%s skipped by filter (%s/%s)", msg.id, media_type, reason)
             return "skipped"
 
         # Content dedup, forced on and cross-account: the registry is keyed by
         # (destination, content), so whichever account already sent this file to
         # the backup channel makes every other account skip it.
         if dedup_repo.is_duplicate(msg, dst_rec.id):
-            logger.debug("Hyper: msg #%s already in backup — skipped", msg.id)
+            self._log.debug("Hyper: msg #%s already in backup — skipped", msg.id)
             return "skipped"
 
         # Out of daily quota: don't send now, let the caller queue it for later.
@@ -1179,7 +1209,7 @@ class CopyEngine:
                 self._client, str(dst_rec.resolved_id or dst_rec.channel_ref)
             )
         except Exception as e:  # noqa: BLE001 — any resolution failure means we can't back up now
-            logger.warning("Hyper: cannot resolve backup channel (%s)", e)
+            self._log.warning("Hyper: cannot resolve backup channel (%s)", e)
             return "failed"
 
         try:
@@ -1192,17 +1222,17 @@ class CopyEngine:
             except FloodWaitError:
                 raise
             except Exception as e:  # noqa: BLE001
-                logger.warning("Hyper: download+upload fallback failed for #%s: %s", msg.id, e)
+                self._log.warning("Hyper: download+upload fallback failed for #%s: %s", msg.id, e)
                 return "failed"
         except FloodWaitError:
             raise
         except Exception as e:  # noqa: BLE001
-            logger.warning("Hyper: forward failed for #%s: %s", msg.id, e)
+            self._log.warning("Hyper: forward failed for #%s: %s", msg.id, e)
             return "failed"
 
         self._record_hyper_transfer(dst_rec.id, msg)
         await self._rate_limiter.wait()
-        logger.info("Hyper: backed up msg #%s (%s) → dest #%d", msg.id, media_type, dst_rec.id)
+        self._log.info("Hyper: backed up msg #%s (%s) → dest #%d", msg.id, media_type, dst_rec.id)
         return "copied"
 
     def _record_hyper_transfer(self, destination_id: int, msg: Message) -> None:
@@ -1336,7 +1366,7 @@ class CopyEngine:
         except FloodWaitError:
             raise
         except Exception as e:
-            logger.warning("Job: send_group_by_ref failed (%s) — falling back to download+upload", e)
+            self._log.warning("Job: send_group_by_ref failed (%s) — falling back to download+upload", e)
 
         # Fallback: download and re-upload
         files: list[bytes] = []

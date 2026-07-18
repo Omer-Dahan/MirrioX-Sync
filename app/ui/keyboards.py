@@ -146,6 +146,7 @@ def kb_job_edit(job: "Job", multi_account: bool = True) -> InlineKeyboardMarkup:
     rows = []
     if multi_account:
         rows.append([_btn(texts.BTN_EDIT_ACCOUNTS, f"je:{jid}:accounts")])
+    rows.append([_btn(texts.BTN_EDIT_DESTS, f"je:{jid}:dests")])
     rows.append([_btn(texts.BTN_EDIT_CONTENT_TYPES, f"je:{jid}:types")])
     rows.append([_btn(filter_btn, f"je:{jid}:tgl_filter")])
     rows.append([_btn(group_btn, f"je:{jid}:tgl_group")])
@@ -173,6 +174,26 @@ def kb_job_edit_userbots(
     if row:
         rows.append(row)
     rows.append([_btn(texts.BTN_WZD_ALL_ACCOUNTS, f"je:{job_id}:all_ubs")])
+    rows.append([_btn(texts.BTN_BACK, f"je:{job_id}:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_job_edit_dest_list(
+    job_id: int, dests: list, selected_ids: set[int] | None = None
+) -> InlineKeyboardMarkup:
+    """Multi-select of destinations, editing an existing job."""
+    if selected_ids is None:
+        selected_ids = set()
+    rows = []
+    row: list = []
+    for dest in dests:
+        check = "✅" if dest.id in selected_ids else "◻"
+        row.append(_btn(f"{check} {dest.display()[:30]}", f"je:{job_id}:dst:{dest.id}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     rows.append([_btn(texts.BTN_BACK, f"je:{job_id}:menu")])
     return InlineKeyboardMarkup(rows)
 
@@ -227,17 +248,24 @@ def kb_wizard_source_list(
     return InlineKeyboardMarkup(rows)
 
 
-def kb_wizard_dest_list(dests: list["Destination"]) -> InlineKeyboardMarkup:
+def kb_wizard_dest_list(
+    dests: list["Destination"], selected_ids: list[int] | None = None
+) -> InlineKeyboardMarkup:
+    if selected_ids is None:
+        selected_ids = []
     rows = []
     row: list = []
     for dest in dests:
-        label = dest.display()[:30]
+        check = "✅" if dest.id in selected_ids else "◻"
+        label = f"{check} {dest.display()[:30]}"
         row.append(_btn(label, f"wzd:dst:{dest.id}"))
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
+    if selected_ids:
+        rows.append([_btn("✔ סיים בחירה", "wzd:done_dests")])
     rows.append([_btn(texts.BTN_ADD + " יעד", "wzd:add_dest")])
     rows.append([_btn(texts.BTN_CANCEL, "job:cancel_wizard")])
     return InlineKeyboardMarkup(rows)

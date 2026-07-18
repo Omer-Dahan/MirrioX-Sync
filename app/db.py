@@ -369,6 +369,10 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     # Optional positive allow-list: when set, only these accounts may run the job.
     # NULL/empty means "any active account" — the original, unrestricted behaviour.
     _add_column_if_missing(conn, "jobs",          "allowed_userbot_ids",  "TEXT")
+    # Full destination list for random fan-out. NULL/empty means the job has a
+    # single destination (the original behaviour); destination_id always holds
+    # the primary (first) destination either way.
+    _add_column_if_missing(conn, "jobs",          "destination_ids",      "TEXT")
     # Channel extra-info columns
     for table in ("sources", "destinations"):
         _add_column_if_missing(conn, table, "username",           "TEXT")

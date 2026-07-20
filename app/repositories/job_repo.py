@@ -259,24 +259,30 @@ def get_continuous_jobs_for(userbot_id: int) -> list[Job]:
     return [Job.from_row(r) for r in rows]
 
 
-def mark_backfill_done(job_id: int) -> None:
+def mark_backfill_done(job_id: int) -> bool:
     """
     History copy finished — the job now moves to its listening phase.
 
     Deliberately leaves the status at 'running' instead of 'completed': a
     continuous job never completes, it just changes phase.
+
+    Returns True only for the caller that actually made the transition. On a
+    sharded job several accounts can finish their last chunk at the same moment
+    and all try to close it; the flag itself decides the winner, so the finishing
+    work that follows happens once.
     """
     conn = db.get_connection()
-    conn.execute(
+    cur = conn.execute(
         """UPDATE jobs SET
              backfill_done = 1,
              assigned_userbot_id = NULL,
              error_message = NULL,
              last_updated_at = datetime('now')
-           WHERE id = ?""",
+           WHERE id = ? AND COALESCE(backfill_done, 0) = 0""",
         (job_id,),
     )
     conn.commit()
+    return cur.rowcount > 0
 
 
 def release_job(job_id: int, status: str = "pending") -> None:
@@ -473,6 +479,7 @@ def update_status(
     status: str,
     error: Optional[str] = None,
     next_retry_at: Optional[str] = None,
+    userbot_id: Optional[int] = None,
 ) -> None:
     conn = db.get_connection()
     # Record submit time the first time the job becomes pending
@@ -498,6 +505,13 @@ def update_status(
             (status, error, next_retry_at, job_id),
         )
     conn.commit()
+    # Every error write funnels through here, so this is the one place that has to
+    # append to the dated log the errors screen reads. Written after the status,
+    # not before: a failed UPDATE would otherwise leave a history entry for a
+    # state the job never actually entered.
+    if error:
+        from app.repositories import job_error_repo
+        job_error_repo.add(job_id, error, userbot_id)
 
 
 def mark_started(job_id: int) -> None:
@@ -513,21 +527,67 @@ def mark_started(job_id: int) -> None:
     conn.commit()
 
 
-def mark_completed(job_id: int) -> None:
+def mark_completed(job_id: int) -> bool:
+    """
+    Close a job as completed. True only for the caller that made the transition.
+
+    The 'running' guard is what keeps a sharded job's finishing work — the retry
+    pass, the summary line, the Telegraph report — from running twice when two
+    accounts close their last chunk at the same moment. It also refuses to
+    overwrite a job the user paused or cancelled in the meantime.
+    """
     # error_message is cleared here, not left to update_status: that one keeps the
     # previous error when passed None (COALESCE), so a job that failed, retried and
     # then succeeded went on showing "שגיאה אחרונה" next to a green completed badge.
     conn = db.get_connection()
-    conn.execute(
+    cur = conn.execute(
         """UPDATE jobs SET
              status = 'completed',
              completed_at = datetime('now'),
              error_message = NULL,
              last_updated_at = datetime('now')
-           WHERE id = ?""",
+           WHERE id = ? AND status = 'running'""",
         (job_id,),
     )
     conn.commit()
+    return cur.rowcount > 0
+
+
+# How far back to look when measuring a job's real throughput, and how much
+# evidence is needed before that measurement is trusted over the settings-based
+# estimate. Short enough to react to a job speeding up or slowing down, long
+# enough that a single batch pause doesn't dominate it.
+_THROUGHPUT_WINDOW_MIN = 30
+_THROUGHPUT_MIN_SAMPLES = 30
+_THROUGHPUT_MIN_SPAN_S = 120
+
+
+def recent_throughput(job_id: int, window_minutes: int = _THROUGHPUT_WINDOW_MIN) -> Optional[float]:
+    """
+    Messages actually processed per second lately, or None without enough signal.
+
+    Measured rather than modelled, so it already contains everything the settings
+    can't predict: how many accounts are on the job, how many messages get skipped
+    for free, albums sent as one call, FloodWait pauses and reconnects.
+
+    The span runs to *now*, not to the newest row, so a job that has gone quiet
+    reports a falling rate instead of the rate it had before it stalled.
+    """
+    conn = db.get_connection()
+    row = conn.execute(
+        """SELECT COUNT(*) AS n,
+                  (julianday('now') - julianday(MIN(processed_at))) * 86400.0 AS span_s
+             FROM copied_messages
+            WHERE job_id = ? AND processed_at >= datetime('now', ?)""",
+        (job_id, f"-{int(window_minutes)} minutes"),
+    ).fetchone()
+
+    if not row or not row["n"] or row["span_s"] is None:
+        return None
+    n, span_s = row["n"], row["span_s"]
+    if n < _THROUGHPUT_MIN_SAMPLES or span_s < _THROUGHPUT_MIN_SPAN_S:
+        return None
+    return n / span_s
 
 
 def add_progress(
@@ -614,6 +674,40 @@ def resume_job(job_id: int) -> None:
     conn.commit()
 
 
+def restart_failed_job(job_id: int) -> bool:
+    """
+    Put a failed job back in the queue, continuing from where it stopped.
+
+    last_processed_id and the job_chunks rows are left untouched on purpose —
+    they are the checkpoint the copy engine resumes from. The retry bookkeeping
+    is reset, otherwise a job that failed on the retry cap would fail again on
+    its first transient error. Returns False if the job was not failed.
+
+    report_url is cleared with it: it describes the run that failed, and leaving
+    it up meant the job screen offered a stale report as though it belonged to the
+    run now in progress. The new run writes its own when it finishes. The
+    job_errors history is deliberately kept — that is the record of why this job
+    needed restarting.
+    """
+    conn = db.get_connection()
+    cur = conn.execute(
+        """UPDATE jobs SET
+             status='pending',
+             assigned_userbot_id=NULL,
+             submitted_at=datetime('now'),
+             retry_count=0,
+             next_retry_at=NULL,
+             error_message=NULL,
+             completed_at=NULL,
+             report_url=NULL,
+             last_updated_at=datetime('now')
+           WHERE id=? AND status='failed'""",
+        (job_id,),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def is_paused(job_id: int) -> bool:
     conn = db.get_connection()
     row = conn.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -648,6 +742,7 @@ def delete(job_id: int) -> bool:
     # Chunks have no FK to jobs (copied_messages taught us that a FK here costs us
     # the stats), so they have to be cleared explicitly or they outlive the job.
     conn.execute("DELETE FROM job_chunks WHERE job_id = ?", (job_id,))
+    conn.execute("DELETE FROM job_errors WHERE job_id = ?", (job_id,))
     cur = conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     conn.commit()
     return cur.rowcount > 0
@@ -720,11 +815,32 @@ def get_report_messages(job_id: int) -> list[dict]:
     ]
 
 
-def get_transfer_stats() -> dict[str, int]:
-    """Return copied-message counts for the last hour, since midnight Israel time, and last 24h.
+def get_failed_source_ids(job_id: int, limit: int = 500) -> list[int]:
+    """
+    Source message IDs this job could not copy — the input to the end-of-job
+    retry pass. Capped so a badly broken run doesn't turn its own tail into a
+    second full pass.
+    """
+    conn = db.get_connection()
+    rows = conn.execute(
+        """SELECT source_message_id FROM copied_messages
+           WHERE job_id = ? AND status = 'failed'
+           ORDER BY source_message_id
+           LIMIT ?""",
+        (job_id, limit),
+    ).fetchall()
+    return [r["source_message_id"] for r in rows]
+
+
+def get_transfer_stats() -> dict:
+    """Return copied-message counts for the last hour, since midnight Israel time,
+    last 24h, and since the very first transfer.
 
     processed_at is stored as UTC in SQLite. Cutoffs are computed in Python using the
     real Israel timezone (Asia/Jerusalem) so DST transitions are handled correctly.
+
+    The all-time figure is a true lifetime total: copied_messages rows deliberately
+    have no FK to jobs, so deleting a job does not erase its transfers from history.
     """
     from datetime import datetime, timezone, timedelta
     from zoneinfo import ZoneInfo
@@ -746,7 +862,9 @@ def get_transfer_stats() -> dict[str, int]:
         """SELECT
              COUNT(CASE WHEN processed_at >= ? THEN 1 END) AS last_hour,
              COUNT(CASE WHEN processed_at >= ? THEN 1 END) AS since_midnight,
-             COUNT(CASE WHEN processed_at >= ? THEN 1 END) AS last_24h
+             COUNT(CASE WHEN processed_at >= ? THEN 1 END) AS last_24h,
+             COUNT(*)                                      AS all_time,
+             MIN(processed_at)                             AS first_at
            FROM copied_messages
            WHERE status = 'copied'""",
         (cutoff_hour, cutoff_midnight, cutoff_24h),
@@ -760,7 +878,8 @@ def get_transfer_stats() -> dict[str, int]:
              cm.userbot_id,
              COUNT(CASE WHEN cm.processed_at >= ? THEN 1 END) AS last_hour,
              COUNT(CASE WHEN cm.processed_at >= ? THEN 1 END) AS since_midnight,
-             COUNT(CASE WHEN cm.processed_at >= ? THEN 1 END) AS last_24h
+             COUNT(CASE WHEN cm.processed_at >= ? THEN 1 END) AS last_24h,
+             COUNT(*)                                         AS all_time
            FROM copied_messages cm
            WHERE cm.status = 'copied'
            GROUP BY cm.userbot_id""",
@@ -775,6 +894,7 @@ def get_transfer_stats() -> dict[str, int]:
             "last_hour": r["last_hour"] or 0,
             "since_midnight": r["since_midnight"] or 0,
             "last_24h": r["last_24h"] or 0,
+            "all_time": r["all_time"] or 0,
         }
 
     # Hyper transfers consume the same account quota (see
@@ -785,28 +905,41 @@ def get_transfer_stats() -> dict[str, int]:
              userbot_id,
              COUNT(CASE WHEN transferred_at >= ? THEN 1 END) AS last_hour,
              COUNT(CASE WHEN transferred_at >= ? THEN 1 END) AS since_midnight,
-             COUNT(CASE WHEN transferred_at >= ? THEN 1 END) AS last_24h
+             COUNT(CASE WHEN transferred_at >= ? THEN 1 END) AS last_24h,
+             COUNT(*)                                        AS all_time,
+             MIN(transferred_at)                             AS first_at
            FROM hyper_transfers
            GROUP BY userbot_id""",
         (cutoff_hour, cutoff_midnight, cutoff_24h),
     ).fetchall()
 
-    hyper_totals = {"last_hour": 0, "since_midnight": 0, "last_24h": 0}
+    hyper_totals = {"last_hour": 0, "since_midnight": 0, "last_24h": 0, "all_time": 0}
+    hyper_first_at = None
     for r in hyper_rows:
         uid = r["userbot_id"] or 0
         stats = userbots_stats.setdefault(
-            uid, {"last_hour": 0, "since_midnight": 0, "last_24h": 0}
+            uid, {"last_hour": 0, "since_midnight": 0, "last_24h": 0, "all_time": 0}
         )
         for key in hyper_totals:
             stats[key] += r[key] or 0
             hyper_totals[key] += r[key] or 0
+        if r["first_at"] and (hyper_first_at is None or r["first_at"] < hyper_first_at):
+            hyper_first_at = r["first_at"]
 
     if not row:
-        return {"last_hour": 0, "since_midnight": 0, "last_24h": 0, "userbots": userbots_stats}
+        return {
+            "last_hour": 0, "since_midnight": 0, "last_24h": 0, "all_time": 0,
+            "first_at": None, "userbots": userbots_stats,
+        }
+    # Both timestamp columns are UTC strings in the same format, so the earlier
+    # of the two is simply the smaller string.
+    first_candidates = [t for t in (row["first_at"], hyper_first_at) if t]
     return {
         "last_hour":      (row["last_hour"] or 0) + hyper_totals["last_hour"],
         "since_midnight": (row["since_midnight"] or 0) + hyper_totals["since_midnight"],
         "last_24h":       (row["last_24h"] or 0) + hyper_totals["last_24h"],
+        "all_time":       (row["all_time"] or 0) + hyper_totals["all_time"],
+        "first_at":       min(first_candidates) if first_candidates else None,
         "userbots":       userbots_stats,
     }
 

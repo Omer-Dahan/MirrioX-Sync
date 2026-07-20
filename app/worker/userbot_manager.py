@@ -328,9 +328,13 @@ class UserbotRunner:
         )
         self._manager.mark_busy(self.userbot.id, job.id)
         try:
-            await self.engine.run_job(job)
+            closed_job = await self.engine.run_job(job)
             job_repo.clear_assignment(job.id, owner_id=self.userbot.id)
-            await self._manager.notify_job_done(self.client, job.id)
+            # Only the account that actually closed the job announces it. On a
+            # sharded job this one may have run out of chunks while others were
+            # still working — the job is not finished and there is nothing to say.
+            if closed_job:
+                await self._manager.notify_job_done(self.client, job.id)
 
         except NoAccessError as e:
             await self._handle_no_access(job, str(e))
@@ -353,11 +357,11 @@ class UserbotRunner:
         Copy one chunk of a job another account is leading.
 
         Every failure path here is deliberately narrower than _run_claimed_job's:
-        the job belongs to its leader, which is copying its own chunks right now.
-        A helper that hits trouble hands its chunk back and gets out of the way —
-        pausing, failing or requeueing the job from here would yank it out from
-        under an account that is working perfectly well. run_chunk has already
-        released the chunk by the time any of this runs.
+        the job belongs to all the accounts working it, not to this one. A helper
+        that hits trouble hands its chunk back and gets out of the way — pausing,
+        failing or requeueing the job from here would yank it out from under
+        accounts that are working perfectly well. run_chunk has already released
+        the chunk by the time any of this runs.
         """
         logger.info(
             "Userbot %s: joined job #%d '%s' on chunk #%d (ids %d–%d)",
@@ -365,7 +369,13 @@ class UserbotRunner:
         )
         self._manager.mark_busy(self.userbot.id, job.id)
         try:
-            await self.engine.run_chunk(job, chunk)
+            closed_job = await self.engine.run_chunk(job, chunk)
+            # This chunk may have been the job's last, in which case run_chunk just
+            # closed the job and this account is the one to announce it. Announcing
+            # on every finished chunk instead sent the user one completion message
+            # per account that happened to finish around the same moment.
+            if closed_job:
+                await self._manager.notify_job_done(self.client, job.id)
 
         except NoAccessError as e:
             # Access is per-account: this one can't reach the channels even though
@@ -431,6 +441,7 @@ class UserbotRunner:
                 job.id,
                 "failed",
                 error="אף חשבון יוזרבוט אינו חבר בערוץ המקור/היעד — הוסף את אחד החשבונות לערוץ ונסה שוב",
+                userbot_id=self.userbot.id,
             )
             job_repo.clear_assignment(job.id, owner_id=self.userbot.id)
             logger.error(
@@ -465,6 +476,7 @@ class UserbotRunner:
                 job.id,
                 "paused",
                 error=f"FloodWait: הגיע למקסימום ניסיונות ({max_retries}) — המשימה הושהתה, ניתן להמשיך ידנית",
+                userbot_id=self.userbot.id,
             )
             job_repo.clear_assignment(job.id, owner_id=self.userbot.id)
             await self._manager.notify_disruption(
@@ -474,7 +486,8 @@ class UserbotRunner:
         else:
             # next_retry_at gates the queue, so no account touches it until it expires.
             job_repo.update_status(
-                job.id, "waiting_retry", error=f"FloodWait {wait_s}s", next_retry_at=retry_at
+                job.id, "waiting_retry", error=f"FloodWait: {wait_s}s",
+                next_retry_at=retry_at, userbot_id=self.userbot.id,
             )
             job_repo.clear_assignment(job.id, owner_id=self.userbot.id)
 
@@ -502,7 +515,9 @@ class UserbotRunner:
         max_retries = state_repo.get_int_setting("max_retries", 5)
 
         if new_count >= max_retries:
-            job_repo.update_status(job.id, "failed", error=str(e)[:500])
+            job_repo.update_status(
+                job.id, "failed", error=str(e)[:500], userbot_id=self.userbot.id
+            )
             job_repo.clear_assignment(job.id, owner_id=self.userbot.id)
             logger.error("Job #%d: max retries reached, marking failed", job.id)
         else:
@@ -513,7 +528,8 @@ class UserbotRunner:
                 job.id, new_count, max_retries, backoff_s, retry_at,
             )
             job_repo.update_status(
-                job.id, "waiting_retry", error=str(e)[:500], next_retry_at=retry_at
+                job.id, "waiting_retry", error=str(e)[:500],
+                next_retry_at=retry_at, userbot_id=self.userbot.id,
             )
             job_repo.clear_assignment(job.id, owner_id=self.userbot.id)
         await self._sleep(5)

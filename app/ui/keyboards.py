@@ -108,7 +108,18 @@ def kb_job_detail(job: "Job") -> InlineKeyboardMarkup:
         rows.append([_btn(texts.BTN_DELETE_JOB, f"job:{job.id}:confirm_delete")])
 
     if job.is_terminal():
+        # A failed job can be fixed (accounts, destinations, filters) and re-run
+        # from its checkpoint.
+        if job.status == "failed":
+            rows.append([_btn(texts.BTN_RESTART_JOB, f"job:{job.id}:restart")])
+            rows.append([_btn(texts.BTN_EDIT_JOB, f"je:{job.id}:menu")])
         rows.append([_btn(texts.BTN_DELETE_JOB, f"job:{job.id}:confirm_delete")])
+
+    from app.repositories import job_error_repo
+
+    err_count = job_error_repo.count(job.id)
+    if err_count:
+        rows.append([_btn(f"⚠️ שגיאות ({err_count:,})", f"job:{job.id}:errors")])
 
     if job.report_url:
         rows.append([_url_btn("📋 דוח שגיאות / דילוגים", job.report_url)])
@@ -116,6 +127,23 @@ def kb_job_detail(job: "Job") -> InlineKeyboardMarkup:
     rows.append([
         _btn(texts.BTN_REFRESH, f"job:{job.id}:view"),
         _btn(texts.BTN_BACK, "menu:jobs"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_job_errors(job_id: int, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = []
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(_btn("⬅️ הקודם", f"job:{job_id}:errors:{page - 1}"))
+        if page < total_pages - 1:
+            nav.append(_btn("הבא ➡️", f"job:{job_id}:errors:{page + 1}"))
+        if nav:
+            rows.append(nav)
+    rows.append([
+        _btn(texts.BTN_REFRESH, f"job:{job_id}:errors:{page}"),
+        _btn(texts.BTN_BACK, f"job:{job_id}:view"),
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -153,6 +181,9 @@ def kb_job_edit(job: "Job", multi_account: bool = True) -> InlineKeyboardMarkup:
     rows.append([_btn(text_btn, f"je:{jid}:tgl_text")])
     rows.append([_btn(cont_btn, f"je:{jid}:tgl_cont")])
     rows.append([_btn(texts.BTN_RESET_EXCLUSIONS, f"je:{jid}:reset_excl")])
+    # Editing a failed job is a fix-and-rerun flow, so it ends with a restart.
+    if job.status == "failed":
+        rows.append([_btn(texts.BTN_SAVE_AND_RESTART, f"je:{jid}:restart")])
     rows.append([_btn(texts.BTN_BACK, f"job:{jid}:view")])
     return InlineKeyboardMarkup(rows)
 

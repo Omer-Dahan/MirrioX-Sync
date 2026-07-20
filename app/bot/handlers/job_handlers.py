@@ -73,12 +73,19 @@ async def dispatch(bot: TelegramClient, event, uid: int) -> None:
         if len(parts) >= 3 and parts[0] == "job":
             job_id = int(parts[1])
             action = parts[2]
-            await _dispatch_job_action(bot, uid, job_id, action)
+            param = parts[3] if len(parts) > 3 else None
+            await _dispatch_job_action(bot, uid, job_id, action, param)
 
 
-async def _dispatch_job_action(bot: TelegramClient, uid: int, job_id: int, action: str) -> None:
+async def _dispatch_job_action(
+    bot: TelegramClient, uid: int, job_id: int, action: str, param: str | None = None
+) -> None:
     if action == "view":
         text, kb = renderer.render_job_detail(job_id)
+        await update_main_message(bot, text, to_telethon(kb))
+    elif action == "errors":
+        page = int(param) if param and param.isdigit() else 0
+        text, kb = renderer.render_job_errors(job_id, page)
         await update_main_message(bot, text, to_telethon(kb))
     elif action == "submit":
         await _job_submit(bot, job_id)
@@ -94,6 +101,8 @@ async def _dispatch_job_action(bot: TelegramClient, uid: int, job_id: int, actio
         await _job_pause(bot, job_id)
     elif action == "resume":
         await _job_resume(bot, job_id)
+    elif action == "restart":
+        await _job_restart(bot, job_id)
 
 
 # ── Job edit (draft / paused) ────────────────────────────────────────────────
@@ -117,10 +126,11 @@ async def _dispatch_edit(bot: TelegramClient, data: str) -> None:
         text, kb = renderer.render_error("משימה לא נמצאה", "jobs")
         await update_main_message(bot, text, to_telethon(kb))
         return
-    # Editing is only safe before a job is live: a draft, or a job the user paused.
-    if job.status not in ("draft", "paused"):
+    # Editing is only safe when a job is not live: a draft, a paused job, or a failed one.
+    if job.status not in ("draft", "paused", "failed"):
         text, kb = renderer.render_error(
-            "ניתן לערוך רק משימות בטיוטה או מושהות. השהה את המשימה תחילה.", "jobs"
+            "ניתן לערוך רק משימות בטיוטה, מושהות או שנכשלו. השהה את המשימה כדי לערוך אותה.",
+            "jobs",
         )
         await update_main_message(bot, text, to_telethon(kb))
         return
@@ -154,6 +164,8 @@ async def _dispatch_edit(bot: TelegramClient, data: str) -> None:
         await _edit_show_content_types(bot, job_id)
     elif action == "type" and param is not None:
         await _edit_toggle_type(bot, job, param)
+    elif action == "restart":
+        await _job_restart(bot, job_id)
     elif action == "dests":
         await _edit_show_destinations(bot, job_id)
     elif action == "dst" and param is not None:
@@ -301,6 +313,28 @@ async def _job_resume(bot: TelegramClient, job_id: int) -> None:
     if job and job.status == "paused":
         job_repo.resume_job(job_id)
         logger.info("Job #%d resumed by user", job_id)
+    text, kb = renderer.render_job_detail(job_id)
+    await update_main_message(bot, text, to_telethon(kb))
+
+
+async def _job_restart(bot: TelegramClient, job_id: int) -> None:
+    """Re-queue a failed job; it continues from its last checkpoint."""
+    from app.repositories import job_repo, job_chunk_repo
+    if not job_repo.restart_failed_job(job_id):
+        # Only a failed job can be restarted. Silently re-rendering the same screen
+        # looked like the button had done nothing at all.
+        text, kb = renderer.render_error(
+            "ניתן להפעיל מחדש רק משימה שנכשלה. פתח את המשימה כדי לראות את מצבה הנוכחי.",
+            "jobs",
+        )
+        await update_main_message(bot, text, to_telethon(kb))
+        return
+
+    # Chunks the failed run left held would otherwise wait out reclaim_stale.
+    released = job_chunk_repo.release_for_job(job_id)
+    logger.info(
+        "Job #%d restarted by user (released %d held chunk(s))", job_id, released,
+    )
     text, kb = renderer.render_job_detail(job_id)
     await update_main_message(bot, text, to_telethon(kb))
 

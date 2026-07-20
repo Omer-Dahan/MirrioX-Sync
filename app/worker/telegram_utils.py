@@ -33,12 +33,23 @@ async def get_entity_safe(client: TelegramClient, ref: str):
         chat_id = int(ref[1:])
         return await client.get_entity(PeerChat(chat_id))
 
-    # Plain positive integer — treat as channel ID (PeerChannel)
+    # Plain positive integer — a channel ID in almost every case, so PeerChannel
+    # is tried first and its error is the one that survives. Telethon reads a bare
+    # positive integer as a *user* id, so when the fallback failed first the error
+    # read "no input entity for PeerUser(...)" and sent whoever saw it in
+    # channel_access looking for the wrong thing entirely.
+    #
+    # The fallback still runs, for refs that genuinely are not channels (a bot, a
+    # user, a small group stored as a bare id), but it stays silent: only the
+    # PeerChannel error is ever reported.
     if re.match(r"^\d+$", ref):
         try:
             return await client.get_entity(PeerChannel(int(ref)))
-        except Exception:  # pylint: disable=broad-exception-caught
-            return await client.get_entity(int(ref))
+        except Exception as channel_err:  # pylint: disable=broad-exception-caught
+            try:
+                return await client.get_entity(int(ref))
+            except Exception:  # pylint: disable=broad-exception-caught
+                raise channel_err from None
 
     # @username or username
     return await client.get_entity(ref)

@@ -155,6 +155,33 @@ class _CollapseNetworkErrors(logging.Filter):
         return True
 
 
+class _TelethonRetryNoise(logging.Filter):
+    """
+    Drop the Telegram-side errors Telethon already retries by itself.
+
+    These arrive as warnings on every busy minute and drowned out the app's own
+    logging. Silencing the whole logger would also hide the real problems it
+    reports — an unauthorized session, an unresolvable entity, a lost update gap —
+    so only these specific, self-healing errors are dropped, and only below ERROR.
+    """
+    RETRIED_ERRORS = (
+        "WorkerBusyTooLongRetry",
+        "InterdcCallError",
+        "PersistentTimestampOutdated",
+        "PersistentTimestampEmpty",
+    )
+    LOGGERS = frozenset({
+        "telethon.client.users",
+        "telethon.client.updates",
+    })
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        if record.levelno >= logging.ERROR:
+            return True
+        text = record.getMessage()
+        return not any(name in text for name in self.RETRIED_ERRORS)
+
+
 class _TelethonReconnectFilter(logging.Filter):
     """
     Condenses Telethon's internal reconnect spam into exactly two lines:
@@ -273,6 +300,15 @@ def _setup_logging() -> None:
     logging.getLogger("telethon").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
+
+    # Transient Telegram-side hiccups that Telethon retries on its own. They made
+    # up over 90% of all warnings in the log, burying the app's own. Filtered by
+    # name rather than by raising the level: these two loggers also report real
+    # problems (unauthorized sessions, entity failures, update-gap losses) that
+    # must stay visible.
+    _rpc_noise = _TelethonRetryNoise()
+    for name in _TelethonRetryNoise.LOGGERS:
+        logging.getLogger(name).addFilter(_rpc_noise)
 
     # One shared stateful filter: emits ONE warning on disconnect, ONE info on restore.
     # Both loggers share the same instance so only one pair of messages is emitted.

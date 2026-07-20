@@ -42,6 +42,25 @@ def render_job_detail(job_id: int) -> tuple[str, InlineKeyboardMarkup]:
     return texts.job_detail_text(job, src, dsts, queue_pos), keyboards.kb_job_detail(job)
 
 
+def render_job_errors(job_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    from app.repositories import job_repo, job_error_repo
+
+    job = job_repo.get_by_id(job_id)
+    if job is None:
+        return texts.error_text(f"משימה #{job_id} לא נמצאה"), keyboards.kb_error_back("jobs")
+
+    size = texts.JOB_ERRORS_PAGE_SIZE
+    total = job_error_repo.count(job_id)
+    total_pages = max(1, (total + size - 1) // size)
+    # Errors are pruned and can be cleared, so a stale page number has to be clamped.
+    page = max(0, min(page, total_pages - 1))
+    entries = job_error_repo.page(job_id, offset=page * size, limit=size)
+    return (
+        texts.job_errors_text(job, entries, page=page, total=total),
+        keyboards.kb_job_errors(job_id, page, total_pages),
+    )
+
+
 def render_job_edit(job_id: int) -> tuple[str, InlineKeyboardMarkup]:
     from app.repositories import job_repo, userbot_repo
     job = job_repo.get_by_id(job_id)

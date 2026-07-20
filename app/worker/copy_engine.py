@@ -5,9 +5,10 @@ A job runs on one account by default: a single ascending pass, which is what
 keeps the destination in source order. When two or more accounts can reach both
 of the job's channels, the account that claimed the job becomes its *leader* and
 splits the source ID range into chunks (job_chunks). Every free account then
-claims chunks of its own, so one job is copied by several accounts at once. The
-leader works chunks like everyone else, but it also waits for the stragglers and
-owns the job's terminal state and report.
+claims chunks of its own, so one job is copied by several accounts at once. Past
+the split the leader is just another worker: whichever account closes the last
+chunk owns the job's terminal state and report, so nobody sits idle waiting for
+the stragglers.
 """
 # pylint: disable=too-many-branches,too-many-statements,too-many-locals
 from __future__ import annotations
@@ -52,8 +53,14 @@ _MIN_CHUNK_IDS = 200
 # A chunk whose owner has been silent this long is assumed dead and handed back.
 # Generous on purpose — see job_chunk_repo.reclaim_stale.
 _CHUNK_STALE_S = 30 * 60
-# How long the leader waits between checks while other accounts finish their chunks.
-_LEADER_WAIT_S = 5
+# Telegram's caption limit for a media message. A longer caption is rejected with
+# MEDIA_CAPTION_TOO_LONG, and in an album that one message takes the whole batch
+# down with it — so an over-long caption keeps a message out of album grouping.
+_MAX_CAPTION_LEN = 1024
+# How often the retry pass re-reads this account's daily count. The pass is capped
+# at a few hundred messages, so this is frequent enough to stop within a handful of
+# sends of the limit without querying once per message.
+_RETRY_CAP_CHECK_EVERY = 25
 
 
 @dataclass
@@ -122,17 +129,20 @@ class CopyEngine:
 
     # ── Entry points ───────────────────────────────────────────────────────────
 
-    async def run_job(self, job: Job) -> None:
+    async def run_job(self, job: Job) -> bool:
         """
         Run a job as its leader — the account that claimed it out of the queue.
 
         With one eligible account this is the same single ordered pass it always
         was. With two or more the job is sharded and this account works chunks
         alongside the others, then closes the job once the last chunk is done.
+
+        Returns True only if this call is the one that closed the job — the
+        caller uses that to decide whether to announce it.
         """
         ctx = await self._prepare(job)
         if ctx is None:
-            return
+            return False
 
         job_repo.mark_started(job.id)
 
@@ -141,35 +151,43 @@ class CopyEngine:
             if outcome == "capped":
                 job_repo.release_job(job.id, "pending")
             if outcome != "completed":
-                return
-            await self._finalize(job, ctx)
-            return
+                return False
+            return await self._finalize(job, ctx)
 
-        await self._lead_sharded(job, ctx)
+        return await self._lead_sharded(job, ctx)
 
-    async def run_chunk(self, job: Job, chunk: JobChunk) -> None:
+    async def run_chunk(self, job: Job, chunk: JobChunk) -> bool:
         """
-        Copy one chunk of a job that another account is leading.
+        Copy one chunk of a sharded job.
 
-        Nothing here touches the job's status: the leader is still running and is
-        the only one allowed to decide the job is finished.
+        A sharded job has no account standing by to close it: the one that copies
+        its last chunk does that too, whichever account that turns out to be. The
+        terminal write inside _finalize is atomic, so two accounts finishing at
+        the same moment still close the job exactly once.
+
+        Returns True only if this call is the one that closed the job.
         """
         ctx = await self._prepare(job)
         if ctx is None:
-            return
+            return False
         try:
             outcome = await self._copy_stream(job, ctx, chunk=chunk)
         except Exception:
             job_chunk_repo.release(chunk.id, self._userbot_id)
             raise
-        if outcome == "completed":
-            job_chunk_repo.mark_done(chunk.id, self._userbot_id)
-        else:
+        if outcome != "completed":
             job_chunk_repo.release(chunk.id, self._userbot_id)
+            return False
+
+        job_chunk_repo.mark_done(chunk.id, self._userbot_id)
+        if job_chunk_repo.count_unfinished(job.id) == 0:
+            return await self._finalize(job, ctx)
+        return False
 
     # ── Leading a sharded job ──────────────────────────────────────────────────
 
-    async def _lead_sharded(self, job: Job, ctx: _JobContext) -> None:
+    async def _lead_sharded(self, job: Job, ctx: _JobContext) -> bool:
+        """True only if this account ended up being the one that closed the job."""
         while True:
             job_chunk_repo.reclaim_stale(job.id, _CHUNK_STALE_S)
             chunk = job_chunk_repo.claim_next(job.id, self._userbot_id)
@@ -189,20 +207,15 @@ class CopyEngine:
                     # account with budget leads it — finished chunks stay done, so
                     # nothing gets copied twice.
                     job_repo.release_job(job.id, "pending")
-                return
+                return False
 
-            left = job_chunk_repo.count_unfinished(job.id)
-            if left == 0:
-                break
-            if job_repo.should_stop(job.id):
-                return
-            self._log.info(
-                "Job #%d: no free chunks — waiting for %d still with other account(s)",
-                job.id, left,
-            )
-            await asyncio.sleep(_LEADER_WAIT_S)
-
-        await self._finalize(job, ctx)
+            # Nothing left to claim. Whoever closes the last chunk finalises the
+            # job — including this account, if it happens to be the one. Standing
+            # by for the stragglers instead used to idle a whole account for as
+            # long as the slowest chunk took.
+            if job_chunk_repo.count_unfinished(job.id) == 0:
+                return await self._finalize(job, ctx)
+            return False
 
     async def _plan_shards(self, job: Job, ctx: _JobContext) -> bool:
         """
@@ -349,28 +362,54 @@ class CopyEngine:
             skip_duplicates=settings.get("skip_duplicates", "0") == "1",
         )
 
-    async def _finalize(self, job: Job, ctx: _JobContext) -> None:
-        """Close a job out: terminal status plus the Telegraph report."""
+    async def _finalize(self, job: Job, ctx: _JobContext) -> bool:
+        """
+        Close a job out: terminal status, retry pass, Telegraph report.
+
+        Returns True only for the account that won the terminal write. That is
+        also the answer to "should I announce this job", which is why it is passed
+        all the way back to the runner: on a sharded job several accounts reach
+        this method, and every one of them announcing sent the user a pile of
+        identical completion messages.
+        """
         # The source can run out at the same moment the user cancels. Never write a
         # terminal state over 'cancelled' — that silently undid the cancel and left
         # the job looking like it had completed normally.
         if job_repo.should_stop(job.id):
             self._log.info("Job #%d: stopped by user at end of run", job.id)
-            return
+            return False
 
-        fresh = job_repo.get_by_id(job.id) or job
+        # Whoever closes the last chunk gets here, and on a sharded job that can be
+        # two accounts at once. The terminal write is the race: only the account
+        # that wins it goes on to retry, log and report, so each happens once.
         if job.continuous:
             # A continuous job doesn't finish — it graduates from copying history
             # to listening for new messages. The worker picks it up as a listener
             # on its next reconcile.
-            job_repo.mark_backfill_done(job.id)
+            if not job_repo.mark_backfill_done(job.id):
+                return False
+        else:
+            if not job_repo.mark_completed(job.id):
+                return False
+
+        # One more attempt at whatever failed, while the channels are still
+        # resolved. Runs before the report so it only lists what stayed broken.
+        # Best-effort by design: the job's terminal state is already written, and
+        # letting a FloodWait out of here would send the caller's error handling
+        # after a job that is finished — rewriting 'completed' into 'waiting_retry'.
+        try:
+            await self._retry_failed(job, ctx)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            self._log.warning("Job #%d: retry pass stopped early (%s)", job.id, e)
+
+        fresh = job_repo.get_by_id(job.id) or job
+        if job.continuous:
             self._log.info(
                 "Job #%d: history copy finished (copied=%d skipped=%d failed=%d) "
                 "— switching to live listening",
                 job.id, fresh.copied_count, fresh.skipped_count, fresh.failed_count,
             )
         else:
-            job_repo.mark_completed(job.id)
             self._log.info(
                 "Job #%d completed: copied=%d skipped=%d failed=%d",
                 job.id, fresh.copied_count, fresh.skipped_count, fresh.failed_count,
@@ -380,7 +419,7 @@ class CopyEngine:
         report_msgs = job_repo.get_report_messages(job.id)
         if not report_msgs:
             self._log.info("Job #%d: no notable messages — Telegraph report skipped", job.id)
-            return
+            return True
         from app.services import telegraph_service
         url = await telegraph_service.create_report(
             job.id, report_msgs, ctx.src_rec.resolved_id, ctx.src_rec.channel_ref
@@ -388,6 +427,89 @@ class CopyEngine:
         if url:
             job_repo.save_report_url(job.id, url)
             self._log.info("Job #%d Telegraph report: %s", job.id, url)
+        return True
+
+    async def _retry_failed(self, job: Job, ctx: _JobContext) -> None:
+        """
+        Give every message that failed one more attempt, once the pass is over.
+
+        Most failures are transient — a busy Telegram worker, an expired file
+        reference, a retry budget spent on a bad minute. Until now they were only
+        written to the report, so anyone who didn't read it lost them silently.
+
+        Exactly one attempt per message: a message that fails twice has a real
+        problem, and looping on it would hold the job open indefinitely.
+        """
+        failed_ids = job_repo.get_failed_source_ids(job.id)
+        if not failed_ids:
+            return
+
+        recovered = 0
+        reclassified = 0
+        for i, msg_id in enumerate(failed_ids):
+            if job_repo.should_stop(job.id):
+                break
+            # This pass sends for real and spends the same daily quota the main
+            # pass does, but it runs after the job's terminal state is written, so
+            # the "capped" hand-back the main loop uses no longer applies. Without
+            # this check an account that finished a job right on its limit went on
+            # to push hundreds of messages past it.
+            if i % _RETRY_CAP_CHECK_EVERY == 0 and self._daily_cap_reached():
+                self._log.warning(
+                    "Job #%d: retry pass stopped at %d/%d — userbot #%s is out of "
+                    "daily quota. The remaining failures stay in the report.",
+                    job.id, i, len(failed_ids), self._userbot_id,
+                )
+                break
+            try:
+                msg = await self._client.get_messages(ctx.src_entity, ids=msg_id)
+            except FloodWaitError:
+                raise
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                self._log.debug("Job #%d: retry could not fetch msg #%d: %s", job.id, msg_id, e)
+                continue
+            if msg is None or not getattr(msg, "id", None):
+                continue  # deleted at the source since the failure
+
+            dest_id, dst_entity = random.choice(ctx.dst_targets)  # nosec B311
+            try:
+                status, skip_reason, ctx.src_is_protected = await self._process_message(
+                    job, msg, ctx.blocked_words, ctx.src_entity, dst_entity,
+                    ctx.src_is_protected, skip_duplicates=ctx.skip_duplicates,
+                )
+            except FloodWaitError:
+                raise
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                # One bad message must not end the pass for all the others — this
+                # is the last chance every remaining failure gets.
+                self._log.debug("Job #%d: retry of msg #%d raised: %s", job.id, msg_id, e)
+                continue
+
+            if status == "failed":
+                continue  # still broken; its row already says so
+
+            # A message that now comes back 'skipped' (blocked word, duplicate, a
+            # content type the job no longer takes) is not a failure any more.
+            # Leaving the row at 'failed' kept it in the counters and in the
+            # report as though the copy had gone wrong.
+            job_repo.record_copied_message(
+                job.id, msg.id, None, status, skip_reason, userbot_id=self._userbot_id
+            )
+            if status == "copied":
+                self._record_transfer(job, msg, dest_id)
+                # The message moved out of 'failed'. add_progress is a plain sum,
+                # so the -1 is safe.
+                job_repo.add_progress(job.id, copied=1, failed=-1)
+                recovered += 1
+                await self._rate_limiter.wait()
+            else:
+                job_repo.add_progress(job.id, skipped=1, failed=-1)
+                reclassified += 1
+
+        self._log.info(
+            "Job #%d: retried %d failed message(s) — %d recovered, %d reclassified as skipped",
+            job.id, len(failed_ids), recovered, reclassified,
+        )
 
     # ── One copy pass ──────────────────────────────────────────────────────────
 
@@ -554,25 +676,31 @@ class CopyEngine:
                         already_done.add(m.id)
                         p.copied += 1
                 else:
-                    # Send only the first message individually (it's the one causing the issue),
-                    # then put the rest back into the buffer so they can form a new album.
-                    first = to_send[0]
-                    st, reason = await _send_single(first)
+                    # Send the first message individually, then put the rest back
+                    # into the buffer so they can form a new album.
+                    #
+                    # There is nothing to inspect that would identify the real
+                    # culprit: SendMultiMediaRequest reports the batch, not the
+                    # item. The one cause we *can* recognise — a caption over the
+                    # limit — is kept out of the buffer entirely further down, so
+                    # it never reaches this batch in the first place.
+                    culprit = to_send[0]
+                    st, reason = await _send_single(culprit)
                     if st == "copied":
                         p.copied += 1
-                        self._record_transfer(job, first, dest_id)
+                        self._record_transfer(job, culprit, dest_id)
                     else:
                         p.failed += 1
                         self._log.warning(
                             "Job #%d: failed to send msg #%d individually: %s",
-                            job.id, first.id, reason,
+                            job.id, culprit.id, reason,
                         )
-                    job_repo.record_copied_message(job.id, first.id, None, st, reason, userbot_id=self._userbot_id)
-                    already_done.add(first.id)
+                    job_repo.record_copied_message(job.id, culprit.id, None, st, reason, userbot_id=self._userbot_id)
+                    already_done.add(culprit.id)
 
                     # Re-queue the remaining messages for the next album attempt
-                    if len(to_send) > 1:
-                        remaining = to_send[1:]
+                    remaining = [m for m in to_send if m.id != culprit.id]
+                    if remaining:
                         self._log.info(
                             "Job #%d: re-queuing %d messages back to solo buffer after album failure",
                             job.id, len(remaining),
@@ -582,15 +710,17 @@ class CopyEngine:
                         # checkpoint past them would make the next run start after
                         # them (_fetch_messages resumes at last_processed_id), so
                         # they would be dropped for good if the job stops here.
-                        # Messages are buffered in ascending id order, so every
-                        # re-queued id is above the one just sent.
-                        checkpoint = first.id
+                        # Messages are buffered in ascending id order, so the
+                        # lowest re-queued id is the first one not yet accounted
+                        # for. The message just sent is below it and is recorded in
+                        # copied_messages, so it is not re-sent on resume.
+                        checkpoint = remaining[0].id - 1
 
             p.flush(checkpoint)
             if job_repo.should_stop(job.id):
                 self._log.info("Job #%d: stop requested (paused/cancelled) after media flush at #%d", job.id, checkpoint)
                 return True
-            await self._rate_limiter.wait(album=True)
+            await self._rate_limiter.wait(album=True, count=len(to_send))
             return False
 
         async def flush_group() -> bool:
@@ -645,8 +775,9 @@ class CopyEngine:
                 self._log.info("Job #%d: stop requested (paused/cancelled) after album flush at #%d", job.id, last_id)
                 return True
             # A fully skipped album sent nothing — pay no delay for it.
-            if any(status == "copied" for status, _ in statuses):
-                await self._rate_limiter.wait(album=True)
+            copied_now = sum(1 for status, _ in statuses if status == "copied")
+            if copied_now:
+                await self._rate_limiter.wait(album=True, count=copied_now)
             return False
 
         try:
@@ -671,7 +802,11 @@ class CopyEngine:
                     if await flush_group():
                         return "stopped"
 
-                    if group_media and self._is_groupable(msg):
+                    # A caption over the limit would be rejected by
+                    # SendMultiMediaRequest and take the whole album with it. The
+                    # individual path below forwards the message with its text
+                    # intact, so such a message never joins the buffer.
+                    if group_media and self._is_groupable(msg) and not self._caption_too_long(msg):
                         # Add to solo buffer (skip if already done)
                         if msg.id not in already_done:
                             solo_media_buffer.append(msg)
@@ -1283,10 +1418,13 @@ class CopyEngine:
                 attributes = list(doc.attributes)
                 force_document = True
 
+        # A protected source has to be re-uploaded, and a fresh upload is subject
+        # to the caption limit — unlike a forward, which carries the original text
+        # over however long it is.
         await self._client.send_file(
             dst_entity,
             file_bytes,
-            caption=text or None,
+            caption=_truncate_caption(text) or None,
             attributes=attributes,
             force_document=force_document,
         )
@@ -1314,7 +1452,14 @@ class CopyEngine:
                 unsupported.append(m.id)
                 continue
             type_name = m.media.__class__.__name__
-            caption = m.text or ""
+            # Solo-media grouping keeps over-long captions out of albums entirely,
+            # but a real grouped_id album arrives as-is — truncating is the only
+            # way to send it at all.
+            #
+            # SendMultiMediaRequest is the raw API: it takes the caption verbatim
+            # and parses nothing, so the markup in .text would reach the channel
+            # as literal characters. .message is the text as Telegram stores it.
+            caption = _truncate_caption(_raw_text(m))
             if type_name == "MessageMediaPhoto":
                 p = m.media.photo
                 input_media = InputMediaPhoto(
@@ -1377,7 +1522,7 @@ class CopyEngine:
                 data: Optional[bytes] = await self._client.download_media(m, file=bytes)
                 if data:
                     files.append(data)
-                    captions.append(m.text if copy_text else "")
+                    captions.append(_truncate_caption(m.text) if copy_text else "")
                 else:
                     failed_downloads.append(m)
             # text-only messages in a group are included via caption, no separate download needed
@@ -1400,6 +1545,29 @@ class CopyEngine:
     def _is_blocked(self, msg: Message, blocked_words: list[str]) -> bool:
         text = (msg.text or "").lower()
         return any(word in text for word in blocked_words)
+
+    def _daily_cap_reached(self) -> bool:
+        """
+        True once this account has spent its daily quota.
+
+        Same rule as the mid-run check in _copy_stream, pulled out so the retry
+        pass — which runs outside that loop — is held to it too.
+        """
+        if self._userbot_id is None:
+            return False
+        from app.ui.texts import DAILY_LIMIT
+        return job_repo.get_daily_count_for_userbot(self._userbot_id) >= DAILY_LIMIT
+
+    @staticmethod
+    def _caption_too_long(msg: Message) -> bool:
+        """
+        True if this message's text cannot survive as an album caption.
+
+        Such a message is kept out of album grouping and forwarded on its own,
+        where Telegram carries the original text over in full — truncating it
+        would lose content that a plain forward keeps.
+        """
+        return _utf16_len(_raw_text(msg)) > _MAX_CAPTION_LEN
 
     @staticmethod
     def _is_groupable(msg: Message) -> bool:
@@ -1456,6 +1624,47 @@ class CopyEngine:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _utf16_len(text: str) -> int:
+    """
+    Caption length the way Telegram counts it: UTF-16 code units, not characters.
+
+    An emoji outside the BMP is one Python character but two units, so counting
+    characters let a caption of 1024 emoji through and Telegram rejected it with
+    MEDIA_CAPTION_TOO_LONG anyway.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _raw_text(msg: Message) -> str:
+    """
+    A message's text without markup.
+
+    Telethon's .text is the message re-rendered in the client's parse mode, so it
+    carries markdown delimiters that .message does not. Those delimiters are not
+    part of what Telegram counts against the caption limit, and on the raw-API
+    album path they are not parsed either — they would land in the destination as
+    literal '**'. .message is the field as Telegram stores it.
+    """
+    return getattr(msg, "message", None) or getattr(msg, "text", None) or ""
+
+
+def _truncate_caption(text: Optional[str]) -> str:
+    """
+    Cut a caption down to what Telegram accepts on a fresh upload.
+
+    Only for paths that re-upload the media. A forward keeps the original text
+    however long it is, so it must never be routed through here.
+    """
+    text = text or ""
+    if _utf16_len(text) <= _MAX_CAPTION_LEN:
+        return text
+    # Trim by code units, backing off a character at a time so a surrogate pair is
+    # never cut in half — half a pair is not valid text and Telegram rejects it.
+    out = text[: _MAX_CAPTION_LEN - 1]
+    while out and _utf16_len(out) > _MAX_CAPTION_LEN - 1:
+        out = out[:-1]
+    return out + "…"
 
 def _parse_date(date_str: Optional[str]) -> Optional[datetime]:
     """

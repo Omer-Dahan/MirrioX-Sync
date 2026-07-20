@@ -97,6 +97,17 @@ CREATE TABLE IF NOT EXISTS job_chunks (
     UNIQUE(job_id, id_from)
 );
 
+-- Append-only log of every error a job hit, so the UI can show a dated history
+-- instead of only the last one. jobs.error_message stays as the "current" error;
+-- this table is the history behind it. No FK to jobs — see job_chunks above.
+CREATE TABLE IF NOT EXISTS job_errors (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id      INTEGER NOT NULL,
+    userbot_id  INTEGER,
+    error       TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS copied_messages (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id            INTEGER NOT NULL,
@@ -274,6 +285,7 @@ CREATE TABLE IF NOT EXISTS transferred_registry (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status        ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_job_chunks_job     ON job_chunks(job_id, status);
+CREATE INDEX IF NOT EXISTS idx_job_errors_job     ON job_errors(job_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_copied_msg_job     ON copied_messages(job_id);
 CREATE INDEX IF NOT EXISTS idx_copied_src_id      ON copied_messages(job_id, source_message_id);
 CREATE INDEX IF NOT EXISTS idx_scan_items_media   ON duplicate_scan_items(scan_id, media_id);

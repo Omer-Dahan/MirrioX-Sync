@@ -45,13 +45,16 @@ class RateLimiter:
         self.batch_pause_min_s = batch_pause_min_s
         self.batch_pause_max_s = batch_pause_max_s
 
-        self._msg_count: int = 0
+        # Send operations, not messages: one album is a single call to Telegram
+        # however many items it carries, and the batch pause is spaced by calls.
+        self._send_count: int = 0
         self._next_batch_pause_at: int = self._new_batch_threshold()
-        # Sliding window of send timestamps for throughput reporting
+        # Sliding window for throughput reporting, one entry per *message* — an
+        # album of ten counts as ten, which is what actually reached the channel.
         self._sent_timestamps: deque[float] = deque()
 
     def _new_batch_threshold(self) -> int:
-        return self._msg_count + random.randint(self.batch_size_min, self.batch_size_max)  # nosec B311
+        return self._send_count + random.randint(self.batch_size_min, self.batch_size_max)  # nosec B311
 
     def update_from_settings(self, settings: dict[str, str]) -> None:
         try:
@@ -72,12 +75,13 @@ class RateLimiter:
         except (ValueError, TypeError):
             pass
 
-    async def wait(self, album: bool = False) -> None:
+    async def wait(self, album: bool = False, count: int = 1) -> None:
         """Random per-message delay, followed by a batch pause when the threshold is hit.
-        Pass album=True after sending a media group — doubles the delay to reduce FloodWait risk."""
+        Pass album=True after sending a media group — doubles the delay to reduce FloodWait risk.
+        Pass count=<items> so throughput reflects messages delivered, not calls made."""
         now = time.monotonic()
-        self._sent_timestamps.append(now)
-        self._msg_count += 1
+        self._sent_timestamps.extend([now] * max(1, count))
+        self._send_count += 1
 
         delay_s = random.uniform(self.min_ms / 1000.0, self.max_ms / 1000.0)  # nosec B311
         if album:
@@ -85,11 +89,11 @@ class RateLimiter:
             self._log.debug("Album delay: %.1fs (2x normal)", delay_s)
         await asyncio.sleep(delay_s)
 
-        if self._msg_count >= self._next_batch_pause_at:
+        if self._send_count >= self._next_batch_pause_at:
             pause_s = random.uniform(self.batch_pause_min_s, self.batch_pause_max_s)  # nosec B311
             self._log.info(
-                "Batch pause after %d messages — sleeping %.0fs before continuing",
-                self._msg_count, pause_s,
+                "Batch pause (%d sends since start) — sleeping %.0fs before continuing",
+                self._send_count, pause_s,
             )
             self._log_throughput()
             await asyncio.sleep(pause_s)

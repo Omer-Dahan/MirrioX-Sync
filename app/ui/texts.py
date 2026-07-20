@@ -78,6 +78,14 @@ MODE_LABELS: dict[str, str] = {
     "single_id":  "1️⃣ הודעה בודדת",
 }
 
+# Same labels without the emoji, for lines that already carry one of their own.
+MODE_LABELS_PLAIN: dict[str, str] = {
+    "all":        "כל ההודעות",
+    "date_range": "טווח תאריכים",
+    "id_range":   "טווח מזהים",
+    "single_id":  "הודעה בודדת",
+}
+
 WORKER_STATUS_LABELS: dict[str, str] = {
     "idle":    "💤 במתינה",
     "running": "▶️ פועל",
@@ -105,6 +113,8 @@ BTN_SUBMIT_JOB      = "▶️ הגש להרצה"
 BTN_PAUSE_JOB       = "⏸ השהה משימה"
 BTN_RESUME_JOB      = "▶️ המשך משימה"
 BTN_EDIT_JOB        = "✏️ ערוך משימה"
+BTN_RESTART_JOB     = "▶️ הפעל מחדש והמשך"
+BTN_SAVE_AND_RESTART = "▶️ שמור והפעל מחדש"
 BTN_EDIT_CONTENT_TYPES = "📁 סוגי תוכן"
 BTN_EDIT_DESTS      = "🎯 ערוך יעדים"
 BTN_RESET_EXCLUSIONS = "🔄 אפס חסימות גישה"
@@ -269,12 +279,8 @@ def main_menu_text(
 ) -> str:
     ws_label = WORKER_STATUS_LABELS.get(worker_status, worker_status)
     if active_job:
-        eta_str = ""
-        if active_job.total_messages > 0 and not (active_job.continuous and active_job.backfill_done):
-            rem = max(0, active_job.total_messages - (active_job.copied_count + active_job.skipped_count + active_job.failed_count))
-            if rem > 0 and active_job.status in ("running", "pending", "waiting_retry"):
-                eta_sec = _estimate_copy_time(rem)
-                eta_str = f" | משוער לסיום: {_format_eta(eta_sec)}"
+        eta_sec = job_eta_seconds(active_job)
+        eta_str = f" | משוער לסיום: {_format_eta(eta_sec)}" if eta_sec else ""
 
         job_line = (
             f"📋 משימה פעילה: <b>{esc(active_job.name)}</b> "
@@ -335,110 +341,154 @@ def scan_row_text(scan: dict) -> str:
 
 # ── Job detail ─────────────────────────────────────────────────────────────────
 
+_DIVIDER = "────────────"
+
+
 def job_detail_text(
     job: "Job",
     source: "Source | None",
     dests: "list[Destination | None]",
     queue_position: "int | None" = None,
 ) -> str:
+    """
+    Two blocks separated by a divider: what the job is doing right now on top,
+    what it was configured to do below. Everything that is not always true —
+    queue position, ETA, retry, error — is a line that simply isn't there when
+    it doesn't apply, so the screen stays short in the common case.
+    """
     src_str = source.display() if source else f"[#{job.source_id}]"
-    dst_str = ", ".join(
+    dst_str = " • ".join(
         d.display() if d else f"[#{i}]"
         for i, d in zip(job.destination_id_list(), dests)
     )
     dst_label = "יעד" if len(dests) <= 1 else "יעדים (אקראי)"
-    status_label = job_status_label(job)
-    mode_label = MODE_LABELS.get(job.mode, job.mode)
 
-    filter_str = "כן" if job.use_blocked_words else "לא"
     ct_parts = [p.strip() for p in (job.content_types or DEFAULT_CONTENT_TYPES).split(",") if p.strip()]
     ct_map = {"image": "תמונות", "video": "סרטונים", "file": "קבצים", "text": "טקסט"}
-    ct_str = ", ".join(ct_map[p] for p in ("image", "video", "file", "text") if p in ct_parts) or "—"
+    ct_str = " | ".join(ct_map[p] for p in ("image", "video", "file", "text") if p in ct_parts) or "—"
 
-    params_line = ""
+    scope = MODE_LABELS_PLAIN.get(job.mode, job.mode)
     if job.mode == "date_range":
-        params_line = f"\nטווח: {job.date_from} – {job.date_to}"
+        scope += f" {job.date_from}–{job.date_to}"
     elif job.mode == "id_range":
-        params_line = f"\nטווח מזהים: #{job.id_from} – #{job.id_to}"
+        scope += f" #{job.id_from}–#{job.id_to}"
     elif job.mode == "single_id":
-        params_line = f"\nמזהה: #{job.single_message_id}"
+        scope += f" #{job.single_message_id}"
+
+    # ── Live block ──
+    live = [
+        f"📊 {job.copied_count:,} הועתקו | {job.skipped_count:,} דולגו | "
+        f"{job.failed_count:,} נכשלו"
+    ]
+    live += _render_runners(job)
+
+    if queue_position:
+        live.append(f"⏳ מיקום בתור: #{queue_position}")
+
+    eta_sec = job_eta_seconds(job, include_paused=True)
+    if eta_sec:
+        prefix = "בהמשכה: נותרו בערך" if job.status == "paused" else "נותרו בערך"
+        live.append(f"⏱️ {prefix} {_format_eta(eta_sec)}")
 
     if job.continuous:
-        phase = (
-            "🟢 שלב 2/2 — מאזין להודעות חדשות"
+        live.append(
+            "🟢 מאזין להודעות חדשות"
             if job.backfill_done
-            else "▶️ שלב 1/2 — מעתיק היסטוריה, יאזין בסיום"
+            else "🔜 בסיום: סנכרון רציף"
         )
-        params_line += f"\n🔄 סנכרון רציף: {phase}"
 
-    queue_line = f"\nמיקום בתור: #{queue_position}" if queue_position else ""
-
-    allowed_line = _job_allowed_line(job)
-
-    runner_line = _render_runners(job)
-
-    retry_info = ""
     if job.status == "waiting_retry":
-        retry_info = f"\n\nניסיון חוזר: {job.retry_count}/{job.max_retries}"
+        retry = f"🔁 ניסיון חוזר {job.retry_count}/{job.max_retries}"
         if job.next_retry_at:
-            retry_info += f" (ב-{_fmt_dt(job.next_retry_at)})"
+            retry += f" · ב-{_fmt_dt(job.next_retry_at)}"
+        live.append(retry)
 
-    error_info = ""
+    # ── Config block ──
+    cfg = [
+        f"📁 מקור: {esc(src_str)}",
+        f"🎯 {dst_label}: {esc(dst_str)}",
+        f"📦 תוכן: {scope} | {ct_str}",
+        f"🔎 סינון מילים: {'פעיל' if job.use_blocked_words else 'כבוי'}",
+    ]
+    allowed = _job_allowed_accounts(job)
+    if allowed:
+        cfg.append(f"🔒 מוגבל לחשבונות: {allowed}")
+    if job.last_processed_id:
+        cfg.append(f"🔖 נקודת המשך: #{job.last_processed_id}")
+    cfg.append(f"🕒 התחלה: {_fmt_dt(job.started_at)}")
+    cfg.append(f"🔄 עדכון אחרון: {_fmt_dt(job.last_updated_at)}")
+    if job.completed_at:
+        cfg.append(f"🏁 סיום: {_fmt_dt(job.completed_at)}")
+
+    # ── Footer ──
+    footer = []
     if job.error_message:
-        error_info = f"\n\n⚠️ שגיאה אחרונה:\n<code>{esc(job.error_message[:200])}</code>"
+        # One dated line only — the full history lives behind the errors button.
+        from app.repositories import job_error_repo
 
-    checkpoint = f"#{job.last_processed_id}" if job.last_processed_id else "—"
-    started  = _fmt_dt(job.started_at)
-    finished = _fmt_dt(job.completed_at)
-    updated  = _fmt_dt(job.last_updated_at)
-
-    report_line = ""
+        latest = job_error_repo.page(job.id, limit=1)
+        when = f" · {_fmt_dt(latest[0]['created_at'])}" if latest else ""
+        footer.append(f"⚠️ {esc(job.error_message[:120])}{when}")
     if job.report_url:
-        report_line = f"\n\n📋 <a href=\"{job.report_url}\">דוח שגיאות / דילוגים</a>"
+        footer.append(f"📋 <a href=\"{job.report_url}\">דוח שגיאות / דילוגים</a>")
 
-    eta_str = ""
-    # Only the listening phase is open-ended. The backfill is a bounded copy, so
-    # an ETA is meaningful there.
-    if job.total_messages > 0 and not (job.continuous and job.backfill_done):
-        rem = max(0, job.total_messages - (job.copied_count + job.skipped_count + job.failed_count))
-        if rem > 0 and job.status in ("running", "pending", "waiting_retry", "paused"):
-            eta_sec = _estimate_copy_time(rem)
-            eta_str = f"\n⏱ זמן משוער לסיום (אופטימלי): {_format_eta(eta_sec)}"
+    blocks = [
+        f"{job_status_label(job)}\n<b>{esc(_job_title(job))}</b>",
+        "\n".join(live),
+        _DIVIDER + "\n" + "\n".join(cfg),
+    ]
+    if footer:
+        blocks.append("\n".join(footer))
+    return "\n\n".join(blocks)
 
-    return (
-        f"{status_label} {esc(job.name)}\n"
-        f"\n"
-        f"שם: {esc(job.name)}\n"
-        f"מזהה: {job.id}\n"
-        f"\n"
-        f"מקור: {esc(src_str)}\n"
-        f"{dst_label}: {esc(dst_str)}\n"
-        f"מצב: {mode_label}{params_line}\n"
-        f"תוכן: {ct_str}\n"
-        f"סינון מילים: {filter_str}\n"
-        f"{allowed_line}"
-        f"סטטוס: {status_label}{queue_line}{runner_line}{eta_str}"
-        f"\n"
-        f"\nתוצאות:\n"
-        f"הועתקו: {job.copied_count}\n"
-        f"דולגו: {job.skipped_count}\n"
-        f"נכשלו: {job.failed_count}\n"
-        f"נקודת המשך: {checkpoint}"
-        f"\n"
-        f"\nזמנים:\n"
-        f"התחלה: {started}\n"
-        f"סיום: {finished}\n"
-        f"עדכון אחרון: {updated}"
-        f"{retry_info}"
-        f"{error_info}"
-        f"{report_line}"
-    )
+
+def _job_title(job: "Job") -> str:
+    """Job names are auto-generated as 'source > destination'; show it as an arrow."""
+    return job.name.replace(" > ", " → ")
+
+
+# ── Job errors ─────────────────────────────────────────────────────────────────
+
+JOB_ERRORS_PAGE_SIZE = 10
+
+
+def job_errors_text(
+    job: "Job",
+    entries: list[dict],
+    page: int = 0,
+    total: int = 0,
+) -> str:
+    """The dedicated errors screen: one dated entry per error, newest first."""
+    header = f"⚠️ <b>שגיאות</b>\n{esc(_job_title(job))}"
+
+    if not entries:
+        return f"{header}\n\nאין שגיאות רשומות למשימה הזו. 🎉"
+
+    from app.repositories import userbot_repo
+
+    lines = []
+    for e in entries:
+        who = ""
+        if e.get("userbot_id"):
+            ub = userbot_repo.get_by_id(e["userbot_id"])
+            if ub:
+                who = f" · {esc(ub.display())}"
+        lines.append(
+            f"🕐 {_fmt_dt(e['created_at'])}{who}\n"
+            f"<code>{esc(str(e['error'])[:200])}</code>"
+        )
+
+    first = page * JOB_ERRORS_PAGE_SIZE + 1
+    last = first + len(entries) - 1
+    counter = f"מציג {first}–{last} מתוך {total:,}"
+
+    return f"{header}\n<i>{counter}</i>\n\n" + "\n\n".join(lines)
 
 
 # ── Job creation wizard ────────────────────────────────────────────────────────
 
-def _job_allowed_line(job: "Job") -> str:
-    """A 'restricted to accounts X, Y' line, or '' when the job runs on all."""
+def _job_allowed_accounts(job: "Job") -> str:
+    """Names of the accounts a job is restricted to, or '' when it runs on all."""
     allowed = job.allowed_ids()
     if not allowed:
         return ""
@@ -449,14 +499,12 @@ def _job_allowed_line(job: "Job") -> str:
         for ub in (userbot_repo.get_by_id(i) for i in sorted(allowed))
         if ub
     ]
-    if not names:
-        return ""
-    return f"חשבונות מריצים: {', '.join(names)}\n"
+    return ", ".join(names)
 
 
-def _render_runners(job: "Job") -> str:
+def _render_runners(job: "Job") -> list[str]:
     """
-    Which account(s) are on this job, and how far a parallel run has got.
+    Chunk progress and which account(s) are on this job, as 0-2 lines.
 
     A sharded job has no single owner: the leader in assigned_userbot_id is just
     the account that claimed it out of the queue, while any number of others may
@@ -468,9 +516,9 @@ def _render_runners(job: "Job") -> str:
     done, total = job_chunk_repo.progress(job.id)
     if total == 0:
         if not job.assigned_userbot_id:
-            return ""
+            return []
         ub = userbot_repo.get_by_id(job.assigned_userbot_id)
-        return f"\n🤖 מבוצע ע\"י: {esc(ub.display())}" if ub else ""
+        return [f"👥 {esc(ub.display())}"] if ub else []
 
     working_ids = set(job_chunk_repo.active_userbot_ids(job.id))
     if job.assigned_userbot_id:
@@ -480,11 +528,15 @@ def _render_runners(job: "Job") -> str:
         for ub in (userbot_repo.get_by_id(i) for i in sorted(working_ids))
         if ub
     ]
-    who = ", ".join(names) if names else "—"
-    line = f"\n🤖 מבוצע ע\"י: {who}"
-    if len(names) > 1:
-        line += f" <b>(מקבילי ×{len(names)})</b>"
-    return line + f"\n🧩 בלוקים: {done:,}/{total:,}"
+
+    lines = [f"🧩 {done:,}/{total:,} בלוקים"]
+    # Three account names on one line is most of the screen, and the names add
+    # nothing while they all work the same job — the count is the useful part.
+    if len(names) > 2:
+        lines.append(f"👥 {len(names)} חשבונות עובדים במקביל")
+    elif names:
+        lines.append(f"👥 {', '.join(names)}")
+    return lines
 
 
 def wizard_header(step: int, total: int, partial: dict) -> str:
@@ -728,11 +780,15 @@ def transfer_stats_text(stats: dict, userbots: list["Userbot"]) -> str:
         f"נוצלו: <b>{today_total:,}</b> / {shared_limit:,}  |  נותרו: <b>{remaining_total:,}</b>"
     )
     
+    first_at = _fmt_dt(stats.get("first_at"))
+    since_str = f" <i>(מאז {first_at.split(' ')[0]})</i>" if first_at != "—" else ""
+
     text = (
         "📊 <b>סטטיסטיקות העברות (כולל)</b>\n\n"
         f"🕐 שעה אחרונה: <b>{stats['last_hour']:,}</b> הודעות\n"
         f"📅 היום (מחצות): <b>{stats['since_midnight']:,}</b> הודעות\n"
         f"📆 24 שעות אחרונות: <b>{stats['last_24h']:,}</b> הודעות\n"
+        f"🏆 מתחילת הפעילות: <b>{stats.get('all_time', 0):,}</b> הודעות{since_str}\n"
         f"\n<b>מכסה כוללת: {shared_limit:,} הודעות</b>"
         f" <i>({DAILY_LIMIT:,} לכל חשבון × {len(active_userbots) or 1})</i>\n"
         f"{limit_line_total}\n"
@@ -741,12 +797,19 @@ def transfer_stats_text(stats: dict, userbots: list["Userbot"]) -> str:
     if userbots:
         text += "\n👥 <b>חלוקה לפי חשבון:</b>\n"
         for ub in userbots:
-            ub_stats = stats.get("userbots", {}).get(ub.id, {"last_hour": 0, "since_midnight": 0, "last_24h": 0})
+            ub_stats = stats.get("userbots", {}).get(
+                ub.id, {"last_hour": 0, "since_midnight": 0, "last_24h": 0, "all_time": 0}
+            )
             ub_today = ub_stats["since_midnight"]
-            
+            ub_all_time = ub_stats.get("all_time", 0)
+
             if ub.status != "active":
                 status_str = f" ({STATUS_LABELS.get(ub.status, ub.status)})"
-                text += f"\n🔸 <b>{ub.display()}</b>{status_str}\n   הועברו היום: <b>{ub_today:,}</b> הודעות\n"
+                text += (
+                    f"\n🔸 <b>{ub.display()}</b>{status_str}\n"
+                    f"   הועברו היום: <b>{ub_today:,}</b> הודעות\n"
+                    f"   סה\"כ מתחילת הפעילות: <b>{ub_all_time:,}</b>\n"
+                )
             else:
                 pct = min(ub_today / DAILY_LIMIT * 100, 100)
                 bar = moon_progress_bar(pct)
@@ -754,6 +817,7 @@ def transfer_stats_text(stats: dict, userbots: list["Userbot"]) -> str:
                     f"\n🔹 <b>{ub.display()}</b>\n"
                     f"   היום: <b>{ub_today:,}</b> / {DAILY_LIMIT:,}  |  נותרו: <b>{max(DAILY_LIMIT - ub_today, 0):,}</b>\n"
                     f"   {bar}\n"
+                    f"   סה\"כ מתחילת הפעילות: <b>{ub_all_time:,}</b>\n"
                 )
             
     return text
@@ -1266,7 +1330,49 @@ def _format_eta(seconds: float) -> str:
     return f"כ-{days} ימים ו-{hrs} שעות"
 
 
-def _estimate_copy_time(remaining_msgs: int) -> float:
+def job_eta_seconds(job: "Job", include_paused: bool = False) -> "float | None":
+    """
+    Seconds left on a job, or None when there is nothing meaningful to estimate.
+
+    The single entry point for both the main menu and the job screen, so they can
+    never disagree about how long a job has left.
+
+    A paused job is not progressing, so its ETA is a "once you resume" figure, not
+    a countdown. The job screen shows it (labelled as such) because that is where
+    the user decides whether to resume; the main menu does not.
+    """
+    if job.total_messages <= 0 or (job.continuous and job.backfill_done):
+        return None
+    estimable = ["running", "pending", "waiting_retry"]
+    if include_paused:
+        estimable.append("paused")
+    if job.status not in estimable:
+        return None
+    remaining = max(
+        0, job.total_messages - (job.copied_count + job.skipped_count + job.failed_count)
+    )
+    if remaining <= 0:
+        return None
+
+    from app.repositories import job_repo
+
+    # Measured throughput wins whenever the job has produced enough of it: it
+    # already reflects parallel accounts, skips, albums and FloodWait, none of
+    # which the settings-based model below can see.
+    rate = job_repo.recent_throughput(job.id)
+    if rate:
+        return remaining / rate
+    return _estimate_copy_time(remaining, job)
+
+
+def _estimate_copy_time(remaining_msgs: int, job: "Job | None" = None) -> float:
+    """
+    Settings-based estimate, used until a job has run long enough to be measured.
+
+    Models one account's pacing, then corrects for the two things that make the
+    raw pacing wrong in practice: several accounts sharing the work, and skipped
+    messages, which are never sent and so pay no delay at all.
+    """
     from app.repositories import state_repo
     settings = state_repo.get_settings_dict()
     min_ms = int(settings.get("min_delay_ms", 2000))
@@ -1275,13 +1381,31 @@ def _estimate_copy_time(remaining_msgs: int) -> float:
     batch_max = int(settings.get("batch_size_max", 100))
     pause_min = int(settings.get("batch_pause_min_s", 60))
     pause_max = int(settings.get("batch_pause_max_s", 120))
-    
+
     avg_delay_s = (min_ms + max_ms) / 2000.0
     avg_batch = (batch_min + batch_max) / 2.0
     avg_pause = (pause_min + pause_max) / 2.0
-    
+
     sec_per_msg = avg_delay_s + (avg_pause / avg_batch)
-    return remaining_msgs * sec_per_msg
+    if job is None:
+        return remaining_msgs * sec_per_msg
+
+    processed = job.copied_count + job.skipped_count
+    if processed >= 100 and job.copied_count:
+        # Assume what's left is skipped at the same rate as what's already done.
+        remaining_msgs = int(remaining_msgs * (job.copied_count / processed))
+
+    return remaining_msgs * sec_per_msg / _working_account_count(job)
+
+
+def _working_account_count(job: "Job") -> int:
+    """How many accounts are copying this job right now — at least 1."""
+    from app.repositories import job_chunk_repo
+
+    ids = set(job_chunk_repo.active_userbot_ids(job.id))
+    if job.assigned_userbot_id:
+        ids.add(job.assigned_userbot_id)
+    return max(1, len(ids))
 
 
 def _estimate_scan_time(remaining_msgs: int) -> float:

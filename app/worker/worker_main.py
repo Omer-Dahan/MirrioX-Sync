@@ -142,8 +142,29 @@ async def run_primary_duties(client: TelegramClient) -> bool:
         return True
 
     state_repo.heartbeat()
+    _requeue_stranded_jobs()
     await park_queue_if_all_capped(client)
     return False
+
+
+def _requeue_stranded_jobs() -> None:
+    """
+    Rescue sharded jobs that finished their last chunk but were never closed.
+
+    See job_chunk_repo.find_stranded_jobs for how a job gets into that state.
+    Putting it back to 'pending' is enough: the account that claims it re-plans
+    nothing (its chunks already exist and are done) and goes straight to closing
+    it out, report included.
+    """
+    from app.repositories import job_chunk_repo
+
+    for job_id in job_chunk_repo.find_stranded_jobs():
+        logger.warning(
+            "Job #%d: all chunks done but the job was never closed — re-queuing "
+            "so an account can finalise it",
+            job_id,
+        )
+        job_repo.update_status(job_id, "pending")
 
 
 def _request_shutdown() -> None:

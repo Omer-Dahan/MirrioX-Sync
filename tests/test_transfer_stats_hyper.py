@@ -56,3 +56,22 @@ def test_display_stats_match_enforcement_count(fresh_db):
     assert enforced == 5  # 3 bulk + 2 hyper
     assert shown == enforced
     assert stats["since_midnight"] == enforced
+
+
+def test_all_time_total_survives_job_deletion(fresh_db):
+    ub, job = fresh_db["ub"], fresh_db["job"]
+
+    for mid in range(1, 4):
+        job_repo.record_copied_message(job.id, mid, None, "copied", userbot_id=ub.id)
+    job_repo.record_copied_message(job.id, 100, None, "skipped", "duplicate", userbot_id=ub.id)
+    for _ in range(2):
+        _seed_hyper_transfer(ub.id)
+
+    stats = job_repo.get_transfer_stats()
+    assert stats["all_time"] == 5  # 3 bulk + 2 hyper, skipped excluded
+    assert stats["userbots"][ub.id]["all_time"] == 5
+    assert stats["first_at"] is not None
+
+    # The lifetime total is history, not a live view of the jobs table.
+    job_repo.delete(job.id)
+    assert job_repo.get_transfer_stats()["all_time"] == 5

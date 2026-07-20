@@ -238,6 +238,55 @@ def release_for_userbot(userbot_id: int) -> int:
     return cur.rowcount
 
 
+def release_for_job(job_id: int) -> int:
+    """
+    Hand back every chunk of one job that is still marked as running.
+
+    A job that failed mid-pass can leave chunks held by an account that is no
+    longer working on them; without this they stay locked until reclaim_stale's
+    (deliberately long) window passes. Checkpoints are kept, so a re-claimed
+    chunk resumes rather than restarts.
+    """
+    conn = db.get_connection()
+    cur = conn.execute(
+        """UPDATE job_chunks SET status='pending', assigned_userbot_id=NULL,
+             updated_at=datetime('now')
+           WHERE job_id=? AND status='running'""",
+        (job_id,),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def find_stranded_jobs(min_idle_minutes: int = 10) -> list[int]:
+    """
+    Sharded jobs whose chunks are all done but which nobody ever closed.
+
+    A sharded job is finished by whichever account marks its last chunk done. If
+    that account dies in the window between mark_done and the terminal write, the
+    job is left at status='running' with every chunk done — and then nothing can
+    reach it: claim_any needs a pending chunk and claim_next_job skips running
+    jobs. It used to sit there until the next process restart picked it up in
+    startup recovery.
+
+    The idle window is what keeps this off the back of an account that is inside
+    _finalize right now: that path takes seconds, and the job's last_updated_at
+    moves with every progress flush while real work is happening.
+    """
+    conn = db.get_connection()
+    rows = conn.execute(
+        """SELECT j.id AS id FROM jobs j
+            WHERE j.status = 'running'
+              AND j.assigned_userbot_id IS NULL
+              AND j.last_updated_at <= datetime('now', ?)
+              AND EXISTS (SELECT 1 FROM job_chunks c WHERE c.job_id = j.id)
+              AND NOT EXISTS (SELECT 1 FROM job_chunks c
+                               WHERE c.job_id = j.id AND c.status != 'done')""",
+        (f"-{int(min_idle_minutes)} minutes",),
+    ).fetchall()
+    return [r["id"] for r in rows]
+
+
 def release_all_running() -> int:
     """Startup recovery: nobody holds a chunk across a restart."""
     conn = db.get_connection()

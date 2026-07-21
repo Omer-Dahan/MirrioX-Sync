@@ -1066,7 +1066,12 @@ CONFIRM_REMOVE_ADMIN = "האם להסיר מנהל זה?"
 SETTINGS_LABELS: dict[str, str] = {
     "min_delay_ms":         "עיכוב מינימלי (מ\"ש)",
     "max_delay_ms":         "עיכוב מקסימלי (מ\"ש)",
-    "flood_wait_buffer_s":  "כיסוי FloodWait (שניות)",
+    # The old 'flood_wait_buffer_s' key was shown here but never read by any
+    # code — editing it changed nothing. These are the keys the worker uses.
+    "flood_buffer_min_s":   "כיסוי FloodWait מינימלי (שניות)",
+    "flood_buffer_max_s":   "כיסוי FloodWait מקסימלי (שניות)",
+    "flood_inline_max_s":   "בליעת FloodWait במקום עד (שניות)",
+    "dest_min_delay_ms":    "עיכוב מינימלי לערוץ יעד (מ\"ש)",
     "max_retries":          "מקסימום ניסיונות חוזרים",
     "heartbeat_interval_s": "מרווח דופק עובד (שניות)",
 }

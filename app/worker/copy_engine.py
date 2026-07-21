@@ -61,6 +61,14 @@ _MAX_CAPTION_LEN = 1024
 # at a few hundred messages, so this is frequent enough to stop within a handful of
 # sends of the limit without querying once per message.
 _RETRY_CAP_CHECK_EVERY = 25
+# How many times one send may be re-attempted after a short FloodWait before the
+# error is allowed out to the runner. A handful of consecutive waits on the same
+# message means the account is genuinely throttled, not momentarily unlucky.
+_FLOOD_INLINE_MAX_ATTEMPTS = 3
+# Messages copied without trouble before the job's retry counter is cleared. The
+# counter exists to catch a job that cannot make progress; a job that has just
+# copied this many in a row plainly can.
+_RETRY_RESET_AFTER_COPIES = 200
 
 
 @dataclass
@@ -126,6 +134,47 @@ class CopyEngine:
         self._resolve_callback = resolve_callback
         self._userbot_id = userbot_id
         self._log = LabeledAdapter(logger, {"label": label}) if label else logger
+        # Refreshed from settings on every job; see _prepare.
+        self._flood_inline_max_s = 60
+
+    # ── FloodWait handling ─────────────────────────────────────────────────────
+
+    async def _flood_retry(self, op: Callable[[], Awaitable], what: str):
+        """
+        Run one send operation, sleeping through short FloodWaits in place.
+
+        Telethon is configured with flood_sleep_threshold=0 so every FloodWait
+        reaches us, and every one of them used to unwind the whole copy pass: a
+        five-second wait cost the job its place in the queue and one of its
+        retries. Anything Telegram says it can forgive within
+        `flood_inline_max_s` is simply waited out and re-attempted from the same
+        point instead. Longer waits — and a message that keeps flooding — still
+        go up to the runner, which is where "this account needs to stop" belongs.
+
+        Safe to re-run: every send this wraps is a single all-or-nothing request,
+        so a FloodWait means nothing reached the destination.
+        """
+        attempts = 0
+        while True:
+            try:
+                return await op()
+            except FloodWaitError as e:
+                attempts += 1
+                if e.seconds > self._flood_inline_max_s or attempts > _FLOOD_INLINE_MAX_ATTEMPTS:
+                    self._rate_limiter.note_flood_wait(e.seconds)
+                    raise
+                self._log.warning(
+                    "%s: FloodWait %ds — waiting in place (attempt %d/%d)",
+                    what, e.seconds, attempts, _FLOOD_INLINE_MAX_ATTEMPTS,
+                )
+                await self._rate_limiter.handle_flood_wait(e.seconds)
+
+    async def note_flood_wait(self, seconds: int, sleep: bool = True) -> None:
+        """Feed a FloodWait the runner caught back into this account's pacing."""
+        if sleep:
+            await self._rate_limiter.handle_flood_wait(seconds)
+        else:
+            self._rate_limiter.note_flood_wait(seconds)
 
     # ── Entry points ───────────────────────────────────────────────────────────
 
@@ -298,6 +347,7 @@ class CopyEngine:
 
         settings = state_repo.get_settings_dict()
         self._rate_limiter.update_from_settings(settings)
+        self._flood_inline_max_s = state_repo.get_int_setting("flood_inline_max_s", 60)
 
         blocked_words: list[str] = []
         if job.use_blocked_words:
@@ -462,7 +512,10 @@ class CopyEngine:
                 )
                 break
             try:
-                msg = await self._client.get_messages(ctx.src_entity, ids=msg_id)
+                msg = await self._flood_retry(
+                    lambda: self._client.get_messages(ctx.src_entity, ids=msg_id),
+                    f"Job #{job.id}: retry fetch of msg #{msg_id}",
+                )
             except FloodWaitError:
                 raise
             except Exception as e:  # pylint: disable=broad-exception-caught
@@ -473,9 +526,12 @@ class CopyEngine:
 
             dest_id, dst_entity = random.choice(ctx.dst_targets)  # nosec B311
             try:
-                status, skip_reason, ctx.src_is_protected = await self._process_message(
-                    job, msg, ctx.blocked_words, ctx.src_entity, dst_entity,
-                    ctx.src_is_protected, skip_duplicates=ctx.skip_duplicates,
+                status, skip_reason, ctx.src_is_protected = await self._flood_retry(
+                    lambda: self._process_message(
+                        job, msg, ctx.blocked_words, ctx.src_entity, dst_entity,
+                        ctx.src_is_protected, skip_duplicates=ctx.skip_duplicates,
+                    ),
+                    f"Job #{job.id}: retry of msg #{msg_id}",
                 )
             except FloodWaitError:
                 raise
@@ -501,7 +557,7 @@ class CopyEngine:
                 # so the -1 is safe.
                 job_repo.add_progress(job.id, copied=1, failed=-1)
                 recovered += 1
-                await self._rate_limiter.wait()
+                await self._rate_limiter.wait(dest_id=dest_id)
             else:
                 job_repo.add_progress(job.id, skipped=1, failed=-1)
                 reclassified += 1
@@ -551,6 +607,21 @@ class CopyEngine:
         _last_progress_log = 0
         _msgs_since_pause_check = 0  # check for pause every 25 messages
         _msgs_since_limit_check = 0  # check daily limit every 100 messages
+        _last_retry_reset = 0
+
+        def maybe_reset_retry() -> None:
+            """
+            Clear the job's retry counter after a long, trouble-free stretch.
+
+            The counter is only meaningful as a measure of *consecutive* trouble.
+            Nothing used to reset it mid-run, so FloodWaits hours apart added up
+            until an unrelated one crossed max_retries and paused a job that was
+            copying perfectly well.
+            """
+            nonlocal _last_retry_reset
+            if p.copied - _last_retry_reset >= _RETRY_RESET_AFTER_COPIES:
+                _last_retry_reset = p.copied
+                job_repo.reset_retry(job.id)
 
         # Buffer for collecting media-group messages before forwarding them together
         pending_group: list[Message] = []
@@ -643,7 +714,10 @@ class CopyEngine:
                     return "failed", str(e)[:200]
 
             if len(to_send) == 1:
-                st, reason = await _send_single(to_send[0])
+                st, reason = await self._flood_retry(
+                    lambda: _send_single(to_send[0]),
+                    f"Job #{job.id}: solo media #{to_send[0].id}",
+                )
                 if st == "copied":
                     p.copied += 1
                     self._record_transfer(job, to_send[0], dest_id)
@@ -655,7 +729,12 @@ class CopyEngine:
                 # Try fast album send via file refs; fall back to individual forwards (not download)
                 album_ok = False
                 try:
-                    await self._send_group_by_ref(to_send, dst_entity, copy_text=job.copy_text)
+                    await self._flood_retry(
+                        lambda: self._send_group_by_ref(
+                            to_send, dst_entity, copy_text=job.copy_text
+                        ),
+                        f"Job #{job.id}: solo-media album of {len(to_send)}",
+                    )
                     album_ok = True
                     self._log.info(
                         "Job #%d: grouped %d solo media into album (ids=%s)",
@@ -685,7 +764,10 @@ class CopyEngine:
                     # limit — is kept out of the buffer entirely further down, so
                     # it never reaches this batch in the first place.
                     culprit = to_send[0]
-                    st, reason = await _send_single(culprit)
+                    st, reason = await self._flood_retry(
+                        lambda: _send_single(culprit),
+                        f"Job #{job.id}: solo media #{culprit.id}",
+                    )
                     if st == "copied":
                         p.copied += 1
                         self._record_transfer(job, culprit, dest_id)
@@ -720,7 +802,8 @@ class CopyEngine:
             if job_repo.should_stop(job.id):
                 self._log.info("Job #%d: stop requested (paused/cancelled) after media flush at #%d", job.id, checkpoint)
                 return True
-            await self._rate_limiter.wait(album=True, count=len(to_send))
+            maybe_reset_retry()
+            await self._rate_limiter.wait(album=True, count=len(to_send), dest_id=dest_id)
             return False
 
         async def flush_group() -> bool:
@@ -744,9 +827,12 @@ class CopyEngine:
 
             # An existing album is forwarded whole to one random destination.
             dest_id, dst_entity = random.choice(dst_targets)  # nosec B311
-            statuses, ctx.src_is_protected = await self._process_group(
-                job, pending, blocked_words, src_entity, dst_entity, ctx.src_is_protected,
-                skip_duplicates=skip_duplicates,
+            statuses, ctx.src_is_protected = await self._flood_retry(
+                lambda: self._process_group(
+                    job, pending, blocked_words, src_entity, dst_entity,
+                    ctx.src_is_protected, skip_duplicates=skip_duplicates,
+                ),
+                f"Job #{job.id}: album of {len(pending)}",
             )
 
             # Every member of `group` is now accounted for — either recorded on an
@@ -776,8 +862,9 @@ class CopyEngine:
                 return True
             # A fully skipped album sent nothing — pay no delay for it.
             copied_now = sum(1 for status, _ in statuses if status == "copied")
+            maybe_reset_retry()
             if copied_now:
-                await self._rate_limiter.wait(album=True, count=copied_now)
+                await self._rate_limiter.wait(album=True, count=copied_now, dest_id=dest_id)
             return False
 
         try:
@@ -823,9 +910,12 @@ class CopyEngine:
                             continue
 
                         dest_id, dst_entity = random.choice(dst_targets)  # nosec B311
-                        status, skip_reason, ctx.src_is_protected = await self._process_message(
-                            job, msg, blocked_words, src_entity, dst_entity, ctx.src_is_protected,
-                            skip_duplicates=skip_duplicates,
+                        status, skip_reason, ctx.src_is_protected = await self._flood_retry(
+                            lambda: self._process_message(
+                                job, msg, blocked_words, src_entity, dst_entity,
+                                ctx.src_is_protected, skip_duplicates=skip_duplicates,
+                            ),
+                            f"Job #{job.id}: msg #{msg.id}",
                         )
 
                         job_repo.record_copied_message(
@@ -887,10 +977,12 @@ class CopyEngine:
                                 )
                                 return "capped"
 
+                        maybe_reset_retry()
+
                         # Skipped messages sent nothing to Telegram — pay no delay
                         # and don't advance the batch-pause counter for them.
                         if status == "copied":
-                            await self._rate_limiter.wait()
+                            await self._rate_limiter.wait(dest_id=dest_id)
                         elif status == "failed":
                             # A failed send still hit the network — brief fixed pause.
                             await asyncio.sleep(1.0)
@@ -1233,6 +1325,7 @@ class CopyEngine:
 
         settings = state_repo.get_settings_dict()
         self._rate_limiter.update_from_settings(settings)
+        self._flood_inline_max_s = state_repo.get_int_setting("flood_inline_max_s", 60)
         skip_duplicates = settings.get("skip_duplicates", "0") == "1"
 
         if msg is None or not hasattr(msg, "id"):
@@ -1264,9 +1357,12 @@ class CopyEngine:
 
         dest_id, dst_entity = random.choice(dst_targets)  # nosec B311
 
-        status, skip_reason, _ = await self._process_message(
-            job, msg, blocked_words, src_entity, dst_entity, False,
-            skip_duplicates=skip_duplicates,
+        status, skip_reason, _ = await self._flood_retry(
+            lambda: self._process_message(
+                job, msg, blocked_words, src_entity, dst_entity, False,
+                skip_duplicates=skip_duplicates,
+            ),
+            f"Job #{job.id} (continuous): live msg #{msg.id}",
         )
 
         job_repo.record_copied_message(job.id, msg.id, None, status, skip_reason, userbot_id=self._userbot_id)
@@ -1281,7 +1377,7 @@ class CopyEngine:
 
         if status == "copied":
             self._record_transfer(job, msg, dest_id)
-            await self._rate_limiter.wait()
+            await self._rate_limiter.wait(dest_id=dest_id)
 
         self._log.info(
             "Job #%d (continuous): live msg #%d → %s%s",
@@ -1350,10 +1446,16 @@ class CopyEngine:
         try:
             # drop_author keeps the backup clean (no "forwarded from"); the source
             # peer is taken from the message itself.
-            await self._client.forward_messages(dst_entity, msg, drop_author=True)
+            await self._flood_retry(
+                lambda: self._client.forward_messages(dst_entity, msg, drop_author=True),
+                f"Hyper: msg #{msg.id}",
+            )
         except ChatForwardsRestrictedError:
             try:
-                await self._send_as_copy(msg, dst_entity, copy_text=True)
+                await self._flood_retry(
+                    lambda: self._send_as_copy(msg, dst_entity, copy_text=True),
+                    f"Hyper: msg #{msg.id} (copy)",
+                )
             except FloodWaitError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -1366,7 +1468,7 @@ class CopyEngine:
             return "failed"
 
         self._record_hyper_transfer(dst_rec.id, msg)
-        await self._rate_limiter.wait()
+        await self._rate_limiter.wait(dest_id=dst_rec.id)
         self._log.info("Hyper: backed up msg #%s (%s) → dest #%d", msg.id, media_type, dst_rec.id)
         return "copied"
 

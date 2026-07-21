@@ -393,6 +393,9 @@ class UserbotRunner:
                 "Userbot %s: FloodWait %ds on job #%d chunk #%d — backing off",
                 self.label, e.seconds, job.id, chunk.id,
             )
+            # Tell this account's rate limiter too: without it the next chunk
+            # starts at exactly the pace Telegram just refused.
+            await self.engine.note_flood_wait(e.seconds, sleep=False)
             buf_min = state_repo.get_int_setting("flood_buffer_min_s", 5)
             buf_max = state_repo.get_int_setting("flood_buffer_max_s", 10)
             await self._sleep(e.seconds + random.uniform(buf_min, buf_max))  # nosec B311 — timing jitter
@@ -458,6 +461,10 @@ class UserbotRunner:
 
     async def _handle_flood_wait(self, job: Job, e: FloodWaitError) -> None:
         wait_s = e.seconds
+        # Short waits are absorbed inside the copy engine now, so anything that
+        # reaches here is either long or repeated. Either way the account's pace
+        # must come down before it resumes.
+        await self.engine.note_flood_wait(wait_s, sleep=False)
         buf_min = state_repo.get_int_setting("flood_buffer_min_s", 5)
         buf_max = state_repo.get_int_setting("flood_buffer_max_s", 10)
         buffer_s = random.uniform(buf_min, buf_max)  # nosec B311 — timing jitter, not crypto
@@ -479,9 +486,8 @@ class UserbotRunner:
                 userbot_id=self.userbot.id,
             )
             job_repo.clear_assignment(job.id, owner_id=self.userbot.id)
-            await self._manager.notify_disruption(
-                self.client, job.id,
-                f"FloodWait — הגיע למקסימום ניסיונות ({max_retries}). המשימה הושהתה — לחץ 'המשך' כדי להמשיך.",
+            await self._manager.notify_flood_wait(
+                self.client, job.id, wait_s, max_retries, self.label,
             )
         else:
             # next_retry_at gates the queue, so no account touches it until it expires.
@@ -903,6 +909,15 @@ class UserbotManager:
     ) -> None:
         from app.worker import worker_main
         await worker_main.send_network_disruption_notification(client, job_id, msg, **kwargs)
+
+    async def notify_flood_wait(
+        self, client: TelegramClient, job_id: int, wait_s: int,
+        max_retries: int, label: str,
+    ) -> None:
+        from app.worker import worker_main
+        await worker_main.send_flood_wait_notification(
+            client, job_id, wait_s, max_retries, label
+        )
 
     async def notify_no_access(self, client: TelegramClient, job_id: int, tried: int) -> None:
         from app.worker import worker_main

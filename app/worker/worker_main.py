@@ -299,6 +299,34 @@ async def send_network_disruption_notification(
     await _notify(state_repo.get_setting("main_chat_id"), text, job_id, f"network_disruption resumed={resumed}")
 
 
+async def send_flood_wait_notification(
+    client: TelegramClient,
+    job_id: int,
+    wait_s: int,
+    max_retries: int,
+    label: str,
+) -> None:
+    """
+    Telegram throttled an account past the job's retry budget.
+
+    Reported separately from a network disruption: nothing is wrong with the
+    connection, and calling it one sent the admin chasing a problem that did not
+    exist. This is Telegram asking for a slower pace.
+    """
+    job = job_repo.get_by_id(job_id)
+    job_name = job.name if job else f"#{job_id}"
+    text = (
+        f"🐢 <b>טלגרם ביקש להאט (FloodWait)</b>\n\n"
+        f"📋 משימה: <b>{job_name}</b>\n"
+        f"🤖 חשבון: <b>{label}</b>\n"
+        f"⏳ המתנה אחרונה: {wait_s} שניות\n"
+        f"🔁 נוצלו כל {max_retries} הניסיונות — המשימה הושהתה.\n\n"
+        f"אין חסימה של החשבון. ניתן ללחוץ 'המשך' כדי לחדש מנקודת ה-checkpoint, "
+        f"ורצוי להגדיל את העיכובים בהגדרות לפני כן."
+    )
+    await _notify(state_repo.get_setting("main_chat_id"), text, job_id, "flood_wait")
+
+
 async def send_no_access_notification(
     client: TelegramClient, job_id: int, tried_accounts: int
 ) -> None:

@@ -310,6 +310,12 @@ INSERT OR IGNORE INTO app_settings(key,value) VALUES
     ('batch_size_max',      '100'),
     ('batch_pause_min_s',   '60'),
     ('batch_pause_max_s',   '120'),
+    -- A FloodWait shorter than this is slept through in place instead of tearing
+    -- the whole job pass down and spending one of its retries.
+    ('flood_inline_max_s',  '60'),
+    -- Minimum spacing per message into one destination channel, shared by every
+    -- account writing to it. 0 disables the shared gate.
+    ('dest_min_delay_ms',   '1000'),
     ('max_retries',         '5'),
     ('heartbeat_interval_s','30'),
     ('skip_duplicates',     '0'),
@@ -411,6 +417,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         "batch_size_max":     "100",
         "batch_pause_min_s":  "60",
         "batch_pause_max_s":  "120",
+        "flood_inline_max_s": "60",
+        "dest_min_delay_ms":  "1000",
         "group_media":        "1",
         # Off by default — preserves the existing "always copy" behaviour
         "skip_duplicates":    "0",

@@ -108,7 +108,10 @@ async def handle_setting_value(bot: TelegramClient, event, uid: int) -> None:
     _limits = {
         "min_delay_ms":         (100,  60000),
         "max_delay_ms":         (100,  60000),
-        "flood_wait_buffer_s":  (0,    300),
+        "flood_buffer_min_s":   (0,    300),
+        "flood_buffer_max_s":   (0,    300),
+        "flood_inline_max_s":   (0,    900),
+        "dest_min_delay_ms":    (0,    60000),
         "max_retries":          (1,    20),
         "heartbeat_interval_s": (5,    300),
     }

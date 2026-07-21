@@ -646,6 +646,21 @@ def increment_retry(job_id: int) -> int:
     return row["retry_count"] if row else 0
 
 
+def reset_retry(job_id: int) -> None:
+    """
+    Clear the retry counter after a long clean stretch of copying.
+
+    The counter is meant to measure *consecutive* trouble, but nothing ever
+    reset it mid-run: five unrelated FloodWaits spread over hours of successful
+    work added up to "max retries reached" and paused a perfectly healthy job.
+    """
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE jobs SET retry_count = 0 WHERE id = ? AND retry_count > 0", (job_id,)
+    )
+    conn.commit()
+
+
 def pause_job(job_id: int) -> None:
     # Clearing the assignment matters for continuous jobs: without it the job
     # would keep its old owner and could never be re-claimed after a resume.

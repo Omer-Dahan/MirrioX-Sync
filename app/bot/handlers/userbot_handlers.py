@@ -7,7 +7,7 @@ from telethon import TelegramClient
 
 from app.config import load_config
 from app.models import ValidationError
-from app.repositories import job_repo, userbot_repo, hyper_repo
+from app.repositories import job_repo, userbot_repo, hyper_repo, script_repo, state_repo
 from app.services import userbot_auth_service as auth
 from app.ui import renderer, texts, keyboards
 from app.ui.keyboards import to_telethon
@@ -35,7 +35,7 @@ async def dispatch(bot: TelegramClient, event, uid: int) -> None:
                 userbot_id = int(parts[1])
             except ValueError:
                 return
-            await _dispatch_action(bot, userbot_id, parts[2])
+            await _dispatch_action(bot, uid, userbot_id, parts)
 
 
 async def _show_list(bot: TelegramClient) -> None:
@@ -43,7 +43,10 @@ async def _show_list(bot: TelegramClient) -> None:
     await update_main_message(bot, text, to_telethon(kb))
 
 
-async def _dispatch_action(bot: TelegramClient, userbot_id: int, action: str) -> None:
+async def _dispatch_action(
+    bot: TelegramClient, uid: int, userbot_id: int, parts: list[str]
+) -> None:
+    action = parts[2]
     if action == "view":
         text, kb = renderer.render_userbot_detail(userbot_id)
     elif action == "enable":
@@ -55,6 +58,9 @@ async def _dispatch_action(bot: TelegramClient, userbot_id: int, action: str) ->
     elif action == "disable":
         _release_jobs(userbot_id)
         userbot_repo.set_status(userbot_id, "inactive", None)
+        failed = script_repo.fail_pending_tasks(userbot_id, "בוטל: החשבון הושבת לפני שהמשימה רצה")
+        if failed:
+            logger.info("Userbot #%d disabled — %d pending task(s) failed", userbot_id, failed)
         logger.info("Userbot #%d disabled", userbot_id)
         text, kb = renderer.render_userbot_detail(userbot_id)
     elif action == "confirm_remove":
@@ -62,9 +68,85 @@ async def _dispatch_action(bot: TelegramClient, userbot_id: int, action: str) ->
     elif action == "remove":
         await _remove(userbot_id)
         text, kb = renderer.render_userbot_list()
+    elif action == "runmenu":
+        text, kb = renderer.render_userbot_run_menu(userbot_id)
+    elif action == "runquick":
+        await _start_run(bot, uid, userbot_id)
+        return
+    elif action == "scripts":
+        text, kb = renderer.render_scripts_for_userbot(userbot_id)
+    elif action == "runscript":
+        if len(parts) < 4:
+            return
+        try:
+            script_id = int(parts[3])
+        except ValueError:
+            return
+        await _run_saved_script(bot, uid, userbot_id, script_id)
+        return
     else:
         return
     await update_main_message(bot, text, to_telethon(kb))
+
+
+# ── Ad-hoc code execution ───────────────────────────────────────────────────────
+
+def _adhoc_enabled() -> bool:
+    return state_repo.get_setting("adhoc_enabled") != "0"
+
+
+async def _start_run(bot: TelegramClient, uid: int, userbot_id: int) -> None:
+    """Prompt the admin for a Python snippet to run on this account."""
+    if not _adhoc_enabled():
+        text, kb = renderer.render_userbot_run_menu(userbot_id)
+        await update_main_message(bot, text, to_telethon(kb))
+        return
+    ud = _state.get_user_data(uid)
+    ud["awaiting_input"] = "userbot_run_code"
+    ud["run_userbot_id"] = userbot_id
+    await update_main_message(
+        bot, texts.PROMPT_RUN_CODE, to_telethon(keyboards.kb_run_cancel(userbot_id))
+    )
+
+
+async def _run_saved_script(
+    bot: TelegramClient, uid: int, userbot_id: int, script_id: int
+) -> None:
+    """Enqueue a saved script to run on this account."""
+    script = script_repo.get_script(script_id)
+    if script is None or not _adhoc_enabled():
+        text, kb = renderer.render_scripts_for_userbot(userbot_id)
+        await update_main_message(bot, text, to_telethon(kb))
+        return
+    script_repo.enqueue_task(userbot_id, script["code"], chat_id=uid, script_id=script_id)
+    logger.info("Enqueued saved script #%d on userbot #%d", script_id, userbot_id)
+    await update_main_message(
+        bot, texts.RUN_SENT_TEXT, to_telethon(keyboards.kb_userbot_run_menu(userbot_id))
+    )
+
+
+async def handle_userbot_run_code(bot: TelegramClient, event, uid: int) -> None:
+    """Capture the snippet text and enqueue it as an ad-hoc task."""
+    await delete_user_message(event)
+    ud = _state.get_user_data(uid)
+    code = (event.message.text or "").strip()
+    userbot_id = ud.pop("run_userbot_id", None)
+    ud.pop("awaiting_input", None)
+
+    if userbot_id is None:
+        text, kb = renderer.render_userbot_list()
+        await update_main_message(bot, text, to_telethon(kb))
+        return
+    if not code or not _adhoc_enabled():
+        text, kb = renderer.render_userbot_run_menu(userbot_id)
+        await update_main_message(bot, text, to_telethon(kb))
+        return
+
+    script_repo.enqueue_task(userbot_id, code, chat_id=uid)
+    logger.info("Enqueued ad-hoc code on userbot #%d", userbot_id)
+    await update_main_message(
+        bot, texts.RUN_SENT_TEXT, to_telethon(keyboards.kb_userbot_run_menu(userbot_id))
+    )
 
 
 def _release_jobs(userbot_id: int) -> int:
@@ -104,6 +186,7 @@ async def _remove(userbot_id: int) -> None:
     if ub is None or ub.is_default:
         return
     _release_jobs(userbot_id)
+    script_repo.fail_pending_tasks(userbot_id, "בוטל: החשבון נמחק לפני שהמשימה רצה")
     hyper_repo.delete_config(userbot_id)
     userbot_repo.delete(userbot_id)
     # Best-effort: the worker's runner notices the row is gone and exits within a

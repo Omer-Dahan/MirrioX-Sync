@@ -38,8 +38,11 @@ from telethon.errors import FloodWaitError
 from app.config import Config
 from app.models import Job, JobChunk, NoAccessError, Userbot
 from app.network_errors import is_network_error
-from app.repositories import job_repo, job_chunk_repo, state_repo, userbot_repo, source_repo, hyper_repo
+from app.repositories import (
+    job_repo, job_chunk_repo, state_repo, userbot_repo, source_repo, hyper_repo, script_repo
+)
 from app.worker.copy_engine import CopyEngine
+from app.worker import script_engine
 
 logger = logging.getLogger(__name__)
 
@@ -91,11 +94,12 @@ class UserbotRunner:
         self.engine: CopyEngine | None = None
         self._listeners: dict[int, object] = {}   # job_id → Telethon handler
         # Hyper backup: one global outgoing-message listener, pinned to this
-        # account. Tracks the destination it is bound to so a config change
-        # re-registers it and the loop-guard knows which chat is the backup.
+        # account. Tracks the destination set it is bound to so a config change
+        # re-registers it and the loop-guard knows which chats are the backups.
         self._hyper_handler: object | None = None
-        self._hyper_dest_id: int | None = None       # destinations.id currently backed up to
-        self._hyper_guard_tgid: int | None = None     # backup channel's Telegram id (loop-guard)
+        self._hyper_dest_ids: list[int] = []          # destinations.id set currently backed up to
+        self._hyper_guard_tgids: set[int] = set()      # backup channels' Telegram ids (loop-guard)
+        self._hyper_all_resolved: bool = False         # False until every destination resolved once
         self._live_lock = asyncio.Lock()          # serialises live sends on this account
         self._last_reconcile = 0.0
         self._last_channel_check = 0.0
@@ -232,6 +236,7 @@ class UserbotRunner:
                 await self._reconcile_listeners()
                 await self._reconcile_hyper()
                 await self._drain_hyper_queue()
+                await self._drain_userbot_tasks()
 
                 # An account that has spent its daily quota stops taking work —
                 # it must never park a job that an account with budget could run.
@@ -659,70 +664,93 @@ class UserbotRunner:
 
         Hyper is pinned to this account: it captures *this* account's outgoing
         messages, so it never migrates to another account the way continuous
-        jobs do. Registering needs a reachable backup channel — its Telegram id
-        is the loop-guard that stops us backing up our own backup.
+        jobs do. It can back up to several channels (random fan-out); every one
+        of their Telegram ids goes into the loop-guard set that stops us backing
+        up our own backups. A channel that can't be resolved yet is retried on the
+        next cycle, so one unreachable backup channel never blocks the others.
         """
         from app.worker.telegram_utils import get_entity_safe
+        from telethon import utils as _tl_utils
 
         cfg = hyper_repo.get_config(self.userbot.id)
         if not (cfg and cfg["enabled"] and cfg["destination_id"]):
             self._remove_hyper_handler()
             return
 
-        # Already listening to this exact destination — nothing to do (and no
-        # entity resolution on the hot path).
-        if self._hyper_handler is not None and self._hyper_dest_id == cfg["destination_id"]:
-            return
-
-        dst_rec = source_repo.get_destination_by_id(cfg["destination_id"])
-        if dst_rec is None:
+        desired = sorted(hyper_repo.get_destination_ids(self.userbot.id))
+        if not desired:
             self._remove_hyper_handler()
             return
 
-        try:
-            dst_entity = await get_entity_safe(
-                self.client, str(dst_rec.resolved_id or dst_rec.channel_ref)
-            )
-        except Exception as e:  # noqa: BLE001 — backup channel not reachable yet; retry next cycle
-            logger.warning(
-                "Userbot %s: hyper backup channel unreachable (%s) — will retry", self.label, e
-            )
-            self._remove_hyper_handler()
+        # Already listening for exactly these destinations, all resolved — nothing
+        # to do (and no entity resolution on the hot path). While some are still
+        # unresolved we fall through and retry them each cycle.
+        if (self._hyper_handler is not None
+                and self._hyper_dest_ids == desired
+                and self._hyper_all_resolved):
             return
 
-        if not dst_rec.resolved_id:
-            try:
-                source_repo.update_destination_resolved(
-                    dst_rec.id, getattr(dst_entity, "title", dst_rec.channel_ref), dst_entity.id
-                )
-            except Exception:  # nosec B110 — best-effort cache update
-                pass
-
-        self._remove_hyper_handler()
         # event.chat_id is a *marked* peer id (negative for channels), so the
         # loop-guard must compare against the marked id, not the raw entity.id.
-        from telethon import utils as _tl_utils
-        guard_tgid = _tl_utils.get_peer_id(dst_entity)
-        handler = self._make_hyper_handler(dst_rec.id, guard_tgid)
+        guard_tgids: set[int] = set()
+        resolved = 0
+        for dest_id in desired:
+            dst_rec = source_repo.get_destination_by_id(dest_id)
+            if dst_rec is None:
+                continue
+            try:
+                dst_entity = await get_entity_safe(
+                    self.client, str(dst_rec.resolved_id or dst_rec.channel_ref)
+                )
+            except Exception as e:  # noqa: BLE001 — channel not reachable yet; retry next cycle
+                logger.warning(
+                    "Userbot %s: hyper backup channel #%d unreachable (%s) — will retry",
+                    self.label, dest_id, e,
+                )
+                continue
+            if not dst_rec.resolved_id:
+                try:
+                    source_repo.update_destination_resolved(
+                        dst_rec.id, getattr(dst_entity, "title", dst_rec.channel_ref), dst_entity.id
+                    )
+                except Exception:  # nosec B110 — best-effort cache update
+                    pass
+            guard_tgids.add(_tl_utils.get_peer_id(dst_entity))
+            resolved += 1
+
+        if not guard_tgids:
+            # None reachable yet — drop any stale handler and retry next cycle.
+            self._remove_hyper_handler()
+            return
+
+        self._remove_hyper_handler()
+        handler = self._make_hyper_handler(guard_tgids)
         self.client.add_event_handler(handler, events.NewMessage(outgoing=True))
         self._hyper_handler = handler
-        self._hyper_dest_id = dst_rec.id
-        self._hyper_guard_tgid = guard_tgid
+        self._hyper_dest_ids = desired
+        self._hyper_guard_tgids = guard_tgids
+        self._hyper_all_resolved = resolved == len(desired)
         logger.info(
-            "Userbot %s: hyper backup ON → %s (dest #%d)",
-            self.label, dst_rec.display(), dst_rec.id,
+            "Userbot %s: hyper backup ON → %d channel(s) reachable of %d (guard=%s)",
+            self.label, resolved, len(desired), sorted(guard_tgids),
         )
 
-    def _make_hyper_handler(self, dest_id: int, guard_tgid: int):
+    def _make_hyper_handler(self, guard_tgids: set[int]):
         async def _handler(event) -> None:
-            # Loop-guard: our backup sends land in the backup channel as outgoing
+            # Loop-guard: our backup sends land in the backup channels as outgoing
             # messages too — never back those up, or every file loops forever.
-            if event.chat_id == guard_tgid:
+            if event.chat_id in guard_tgids:
                 return
             cfg = hyper_repo.get_config(self.userbot.id)
-            if not cfg or not cfg["enabled"] or cfg["destination_id"] != dest_id:
+            if not cfg or not cfg["enabled"] or not cfg["destination_id"]:
                 return
-            dst_rec = source_repo.get_destination_by_id(dest_id)
+            dest_ids = hyper_repo.get_destination_ids(self.userbot.id)
+            if not dest_ids:
+                return
+            # Random fan-out: this message is backed up to one of the channels;
+            # dedup (inside the engine) still spans all of them.
+            primary = dest_ids[0]
+            dst_rec = source_repo.get_destination_by_id(random.choice(dest_ids))
             if dst_rec is None:
                 return
             rules = hyper_repo.get_filters(self.userbot.id)
@@ -732,21 +760,21 @@ class UserbotRunner:
                     # Passing _is_capped defers (returns 'queued') instead of sending
                     # when out of quota, so a busy/capped moment never loses an upload.
                     status = await self.engine.handle_hyper_message(
-                        dst_rec, event.message, rules, is_capped=self._is_capped
+                        dst_rec, event.message, rules, dest_ids, is_capped=self._is_capped
                     )
                 except FloodWaitError as e:
                     logger.warning(
                         "Userbot %s: hyper FloodWait %ds — queuing for later", self.label, e.seconds
                     )
-                    hyper_repo.enqueue(self.userbot.id, chat_id, message_id, dest_id)
+                    hyper_repo.enqueue(self.userbot.id, chat_id, message_id, primary)
                     await self._sleep(min(e.seconds + 5, 120))
                     return
                 except Exception as e:  # noqa: BLE001
                     logger.exception("Userbot %s: hyper message failed: %s", self.label, e)
-                    hyper_repo.enqueue(self.userbot.id, chat_id, message_id, dest_id)
+                    hyper_repo.enqueue(self.userbot.id, chat_id, message_id, primary)
                     hyper_repo.add_progress(self.userbot.id, failed=1)
                     return
-            self._apply_hyper_live_status(status, chat_id, message_id, dest_id)
+            self._apply_hyper_live_status(status, chat_id, message_id, primary)
 
         return _handler
 
@@ -779,8 +807,8 @@ class UserbotRunner:
             return
         if self._is_capped() or hyper_repo.queue_count(self.userbot.id) == 0:
             return
-        dst_rec = source_repo.get_destination_by_id(cfg["destination_id"])
-        if dst_rec is None:
+        dest_ids = hyper_repo.get_destination_ids(self.userbot.id)
+        if not dest_ids:
             return
         rules = hyper_repo.get_filters(self.userbot.id)
 
@@ -803,10 +831,18 @@ class UserbotRunner:
                 hyper_repo.queue_remove(row["id"])  # source message deleted — nothing to back up
                 continue
 
+            # Fan-out is re-picked at drain time from the current channel set, so a
+            # channel removed while the item waited is simply never chosen.
+            dst_rec = source_repo.get_destination_by_id(random.choice(dest_ids))
+            if dst_rec is None:
+                if hyper_repo.queue_bump_attempts(row["id"]) >= _HYPER_MAX_ATTEMPTS:
+                    hyper_repo.queue_remove(row["id"])
+                continue
+
             async with self._live_lock:
                 try:
                     status = await self.engine.handle_hyper_message(
-                        dst_rec, msg, rules, is_capped=self._is_capped
+                        dst_rec, msg, rules, dest_ids, is_capped=self._is_capped
                     )
                 except FloodWaitError as e:
                     await self._sleep(min(e.seconds + 5, 120))
@@ -828,6 +864,39 @@ class UserbotRunner:
                     hyper_repo.queue_remove(row["id"])
                     hyper_repo.add_progress(self.userbot.id, failed=1)
 
+    async def _drain_userbot_tasks(self) -> None:
+        """
+        Run one queued ad-hoc code task for this account, if any.
+
+        Admin-only remote execution (gated by ADMIN_IDS at the bot layer and the
+        `adhoc_enabled` setting). The task is pinned to this account, so claiming
+        needs no cross-account race handling. One task per poll cycle keeps the
+        loop responsive; the snippet itself is bounded by script_engine's timeout.
+        A failure here is contained: it is reported to the admin, never crashes
+        the runner.
+        """
+        if state_repo.get_setting("adhoc_enabled") == "0":
+            return
+        task = script_repo.claim_next_task(self.userbot.id)
+        if task is None:
+            return
+
+        logger.info("Userbot %s: running ad-hoc task #%d", self.label, task["id"])
+        try:
+            status, output = await script_engine.run_snippet(
+                self.client, task["code"], chat_id=task["chat_id"]
+            )
+        except Exception as e:  # noqa: BLE001 — never let a task kill the runner
+            logger.exception("Userbot %s: ad-hoc task #%d crashed: %s", self.label, task["id"], e)
+            status, output = "error", f"internal error: {e}"
+
+        script_repo.finish_task(task["id"], status, output)
+        try:
+            from app.worker import worker_main
+            await worker_main.send_task_completion_notification(task["id"])
+        except Exception as e:  # noqa: BLE001 — notification is best-effort
+            logger.warning("Userbot %s: task #%d notification failed: %s", self.label, task["id"], e)
+
     def _remove_hyper_handler(self) -> None:
         if self._hyper_handler is None:
             return
@@ -837,8 +906,9 @@ class UserbotRunner:
         except Exception:  # nosec B110 — handler may already be gone
             pass
         self._hyper_handler = None
-        self._hyper_dest_id = None
-        self._hyper_guard_tgid = None
+        self._hyper_dest_ids = []
+        self._hyper_guard_tgids = set()
+        self._hyper_all_resolved = False
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

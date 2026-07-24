@@ -41,7 +41,7 @@ def create_draft_job(
     # first, continuous says to keep listening once that history is done.
     _validate_mode_params(mode, date_from, date_to, id_from, id_to, single_message_id)
 
-    return job_repo.create(
+    job = job_repo.create(
         name=name,
         source_id=source_id,
         destination_id=dest_ids[0],
@@ -60,6 +60,24 @@ def create_draft_job(
         continuous=continuous,
         allowed_userbot_ids=allowed_userbot_ids,
     )
+
+    # Resume from a saved watermark: if this exact pair was synced before (even by
+    # a job since deleted), continue past that history instead of scanning it
+    # again. Only for full-history single-destination jobs — the same shape that
+    # writes the watermark — so the seeded checkpoint always means "everything up
+    # to here already reached this destination".
+    if mode == "all" and len(dest_ids) == 1:
+        from app.repositories import channel_sync_repo
+        watermark = channel_sync_repo.get_watermark(source_id, dest_ids[0])
+        if watermark > 0:
+            job_repo.seed_checkpoint(job.id, watermark)
+            logger.info(
+                "Job #%d seeded from saved sync watermark #%d (source #%d → destination #%d)",
+                job.id, watermark, source_id, dest_ids[0],
+            )
+            return _require_job(job.id)
+
+    return job
 
 
 def update_destinations(job_id: int, destination_ids: list[int]) -> Job:

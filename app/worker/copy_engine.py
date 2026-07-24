@@ -452,6 +452,16 @@ class CopyEngine:
         except Exception as e:  # pylint: disable=broad-exception-caught
             self._log.warning("Job #%d: retry pass stopped early (%s)", job.id, e)
 
+        # Persist the pair's sync watermark now that the history is fully covered.
+        # No-op unless this is a full-history, single-destination job — see
+        # channel_sync_repo.record_from_job. Best-effort: a bookkeeping write must
+        # never turn a finished job into a failed one.
+        try:
+            from app.repositories import channel_sync_repo
+            channel_sync_repo.record_from_job(job)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            self._log.warning("Job #%d: could not record sync watermark (%s)", job.id, e)
+
         fresh = job_repo.get_by_id(job.id) or job
         if job.continuous:
             self._log.info(
@@ -1388,17 +1398,28 @@ class CopyEngine:
     # ── Hyper backup ───────────────────────────────────────────────────────────
 
     async def handle_hyper_message(
-        self, dst_rec, msg: Message, rules: dict, is_capped: Optional[Callable[[], bool]] = None
+        self,
+        dst_rec,
+        msg: Message,
+        rules: dict,
+        all_dest_ids: list[int],
+        is_capped: Optional[Callable[[], bool]] = None,
     ) -> str:
         """
-        Back up one outgoing message to the account's hyper backup channel.
+        Back up one outgoing message to one of the account's hyper backup channels.
+
+        `dst_rec` is the single channel this message is sent to — the caller picks
+        it at random from the account's backup channels (fan-out, like a job's
+        multi-destination). `all_dest_ids` is the full set of those channels, used
+        only for the duplicate check below.
 
         Media only (text returns 'skipped'), gated by the per-account smart
-        filter, and always de-duplicated against the destination — hyper's whole
-        point is "don't store the same file twice", so dedup is forced on here
-        regardless of the global skip_duplicates setting. The loop-guard that
-        stops us backing up our own backup lives in the caller (it compares the
-        event's chat to the backup channel before we ever get here).
+        filter, and always de-duplicated across *all* backup channels — hyper's
+        whole point is "don't store the same file twice", so a file already sent
+        to any of the account's backup channels is skipped here, regardless of the
+        global skip_duplicates setting. The loop-guard that stops us backing up our
+        own backup lives in the caller (it compares the event's chat to the set of
+        backup channels before we ever get here).
 
         `is_capped` is checked only *after* the filter and dedup pass, so an item
         that would be sent but for the daily cap returns 'queued' (the caller
@@ -1424,8 +1445,9 @@ class CopyEngine:
 
         # Content dedup, forced on and cross-account: the registry is keyed by
         # (destination, content), so whichever account already sent this file to
-        # the backup channel makes every other account skip it.
-        if dedup_repo.is_duplicate(msg, dst_rec.id):
+        # any of the backup channels makes every other account — and every other
+        # backup channel in the fan-out — skip it.
+        if dedup_repo.is_duplicate_any(msg, all_dest_ids):
             self._log.debug("Hyper: msg #%s already in backup — skipped", msg.id)
             return "skipped"
 

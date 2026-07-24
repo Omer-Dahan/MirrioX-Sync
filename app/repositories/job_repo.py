@@ -753,6 +753,18 @@ def is_cancelled(job_id: int) -> bool:
 
 
 def delete(job_id: int) -> bool:
+    # Persist the pair's sync watermark before the job is gone. copied_messages
+    # survives the delete, but nothing else remembers "this pair is synced up to
+    # here" once the job row is removed — so a listening job deleted to declutter
+    # the queue would otherwise force the next re-sync to scan everything again.
+    # Only a history-complete job leaves a watermark: a completed run, or a
+    # continuous job past backfill (now listening). A partial sharded run can have
+    # gaps below its highest copied id, so its id is not a safe resume point.
+    job = get_by_id(job_id)
+    if job is not None and (job.status == "completed" or job.backfill_done):
+        from app.repositories import channel_sync_repo
+        channel_sync_repo.record_from_job(job)
+
     conn = db.get_connection()
     # Chunks have no FK to jobs (copied_messages taught us that a FK here costs us
     # the stats), so they have to be cleared explicitly or they outlive the job.
@@ -1009,6 +1021,63 @@ def backfill_userbot_attribution(userbot_id: int) -> int:
     )
     conn.commit()
     return cur.rowcount
+
+
+def get_max_copied_source_id(job_id: int) -> int:
+    """
+    Highest source message id this job ever recorded — copied, skipped or failed.
+
+    Every id at or below it has been accounted for, so it is the true "processed
+    up to here" watermark even for a sharded job, whose job-wide last_processed_id
+    is never maintained (each chunk keeps its own). Returns 0 if nothing was
+    recorded.
+    """
+    conn = db.get_connection()
+    row = conn.execute(
+        "SELECT MAX(source_message_id) AS m FROM copied_messages WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    return row["m"] if row and row["m"] else 0
+
+
+def get_safe_watermark_source_id(job_id: int) -> int:
+    """
+    Highest source id that is safe to skip on a future re-sync.
+
+    Unlike get_max_copied_source_id, this stops just below the *first* failed
+    message: a watermark must guarantee everything at or below it was actually
+    delivered, and a failed row was not. Skipping past it would drop that message
+    forever. Returns the full processed max when nothing failed, or 0 if nothing
+    was recorded (or the very first message failed).
+    """
+    conn = db.get_connection()
+    row = conn.execute(
+        "SELECT MIN(source_message_id) AS m FROM copied_messages "
+        "WHERE job_id = ? AND status = 'failed'",
+        (job_id,),
+    ).fetchone()
+    first_failed = row["m"] if row and row["m"] else None
+    if first_failed is None:
+        return get_max_copied_source_id(job_id)
+    return max(first_failed - 1, 0)
+
+
+def seed_checkpoint(job_id: int, last_processed_id: int) -> None:
+    """
+    Seed a fresh job's resume point from a saved sync watermark.
+
+    Only meaningful before the job has run: the copy engine reads
+    last_processed_id as its starting min_id, so this makes the job continue past
+    history already synced instead of scanning it again. Guarded to jobs that have
+    not started, so it can never rewind a job already in progress.
+    """
+    conn = db.get_connection()
+    conn.execute(
+        """UPDATE jobs SET last_processed_id = ?, last_updated_at = datetime('now')
+           WHERE id = ? AND last_processed_id IS NULL AND status IN ('draft','pending')""",
+        (last_processed_id, job_id),
+    )
+    conn.commit()
 
 
 def is_message_processed(job_id: int, source_message_id: int) -> bool:

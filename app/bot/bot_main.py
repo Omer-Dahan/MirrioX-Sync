@@ -40,6 +40,27 @@ async def send_notification(chat_id: int, text: str) -> None:
         logger.warning("send_notification failed: %s", e)
 
 
+async def send_document(chat_id: int, file, caption=None, filename=None) -> None:
+    """
+    Send a document via the management bot. `file` may be a path (str) or raw bytes;
+    for bytes, `filename` names the uploaded file. Used by the ad-hoc code feature
+    to deliver a snippet's exported file back to the admin.
+    """
+    if _bot is None:
+        logger.warning("send_document called before bot is ready")
+        return
+    try:
+        upload = file
+        if isinstance(file, (bytes, bytearray)):
+            import io
+            upload = io.BytesIO(bytes(file))
+            upload.name = filename or "file.bin"
+        # parse_mode=None: the caption is arbitrary user text and must not be parsed.
+        await _bot.send_file(chat_id, upload, caption=caption, parse_mode=None)
+    except Exception as e:
+        logger.warning("send_document failed: %s", e)
+
+
 # ── Auth helpers ───────────────────────────────────────────────────────────────
 
 def _is_authorized(uid: int, bootstrap_ids: list[int]) -> bool:
@@ -105,6 +126,16 @@ async def run_async(config: Config) -> None:
         data = event.data.decode()
         _state._bot_data["on_main_screen"] = (data == "menu:main")
 
+        # A pending quick-run code prompt is only ever answered by a text message.
+        # Any button press means the admin navigated away (cancel, back, another
+        # menu), so abandon the capture — otherwise their next message would be run
+        # as code. Cleared before dispatch so a handler that re-arms it (runquick)
+        # still works. Note: runquick sets awaiting_input during dispatch below.
+        ud = _state.get_user_data(uid)
+        if ud.get("awaiting_input") == "userbot_run_code":
+            ud.pop("awaiting_input", None)
+            ud.pop("run_userbot_id", None)
+
         try:
             if data == "menu:main":
                 await event.answer()
@@ -150,6 +181,10 @@ async def run_async(config: Config) -> None:
             elif data.startswith("hyp:"):
                 from app.bot.handlers import hyper_handlers
                 await hyper_handlers.dispatch(bot, event, uid)
+
+            elif data.startswith("scr:"):
+                from app.bot.handlers import script_handlers
+                await script_handlers.dispatch(bot, event, uid)
 
             elif data == "menu:stats":
                 await event.answer()
@@ -209,6 +244,9 @@ async def run_async(config: Config) -> None:
             "userbot_code":     ("userbot_handlers", "handle_userbot_code"),
             "userbot_2fa":      ("userbot_handlers", "handle_userbot_2fa"),
             "hyper_value":      ("hyper_handlers",  "handle_hyper_value"),
+            "userbot_run_code": ("userbot_handlers", "handle_userbot_run_code"),
+            "script_name":      ("script_handlers", "handle_script_name"),
+            "script_code":      ("script_handlers", "handle_script_code"),
         }
         entry = _dispatch_text.get(awaiting)
         if entry:
@@ -277,6 +315,8 @@ async def _handle_paging(bot: TelegramClient, event, data: str) -> None:
         text, kb = renderer.render_admin_list(bootstrap_ids, page=page)
     elif screen == "userbots":
         text, kb = renderer.render_userbot_list(page=page)
+    elif screen == "scripts":
+        text, kb = renderer.render_scripts_list(page=page)
     else:
         return
 

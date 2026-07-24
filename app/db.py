@@ -269,6 +269,34 @@ CREATE TABLE IF NOT EXISTS hyper_queue (
     UNIQUE(userbot_id, chat_id, message_id, dest_id)
 );
 
+-- Global library of reusable Python snippets (like Linux scripts/aliases).
+-- Any script may be run on any userbot account the admin selects.
+CREATE TABLE IF NOT EXISTS scripts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL UNIQUE,
+    code       TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Ad-hoc code execution queue / history, one row per run, pinned to one account.
+-- The bot enqueues a row; the target account's runner claims and runs it against
+-- its live client (bot and worker share only the DB — same pattern as scans).
+-- A run is bound to a single userbot, so there is never a cross-account race.
+CREATE TABLE IF NOT EXISTS userbot_tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    userbot_id  INTEGER NOT NULL,
+    script_id   INTEGER,                 -- NULL = one-off quick run
+    code        TEXT NOT NULL,           -- snapshot of the code at run time
+    status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','running','done','error')),
+    output      TEXT,                    -- stdout + return value + traceback
+    chat_id     INTEGER,                 -- admin chat to deliver the result to
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at  TEXT,
+    finished_at TEXT
+);
+
 -- Global registry of every transferred item, keyed by content.
 -- Scope is per-destination: the same content may be sent to different channels.
 CREATE TABLE IF NOT EXISTS transferred_registry (
@@ -283,7 +311,26 @@ CREATE TABLE IF NOT EXISTS transferred_registry (
     UNIQUE(destination_id, dedup_key)
 );
 
+-- Durable per-channel-pair sync watermark. One row per (source, destination):
+-- the highest source message id already synced to that destination, and when.
+-- Deliberately keyed on the channel pair, not on a job — so it survives job
+-- deletion and lets a future re-sync of the same pair resume from here instead
+-- of scanning the whole history again. Only full-history ('all') single-destination
+-- jobs write it, because only for those does "everything up to id X is delivered"
+-- actually hold. See channel_sync_repo.
+CREATE TABLE IF NOT EXISTS channel_sync_state (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id      INTEGER NOT NULL,
+    destination_id INTEGER NOT NULL,
+    last_synced_id INTEGER NOT NULL DEFAULT 0,
+    last_synced_at TEXT,
+    last_job_name  TEXT,
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(source_id, destination_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_jobs_status        ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_channel_sync_pair  ON channel_sync_state(source_id, destination_id);
 CREATE INDEX IF NOT EXISTS idx_job_chunks_job     ON job_chunks(job_id, status);
 CREATE INDEX IF NOT EXISTS idx_job_errors_job     ON job_errors(job_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_copied_msg_job     ON copied_messages(job_id);
@@ -293,6 +340,7 @@ CREATE INDEX IF NOT EXISTS idx_transferred_key    ON transferred_registry(destin
 CREATE INDEX IF NOT EXISTS idx_hyper_filters_ub    ON hyper_filters(userbot_id);
 CREATE INDEX IF NOT EXISTS idx_hyper_transfers_ub  ON hyper_transfers(userbot_id, transferred_at);
 CREATE INDEX IF NOT EXISTS idx_hyper_queue_ub      ON hyper_queue(userbot_id, id);
+CREATE INDEX IF NOT EXISTS idx_userbot_tasks_claim ON userbot_tasks(userbot_id, status, id);
 CREATE INDEX IF NOT EXISTS idx_userbots_status    ON userbots(status);
 CREATE INDEX IF NOT EXISTS idx_channel_access_ch  ON channel_access(channel_kind, channel_id);
 -- NOTE: the index on copied_messages(userbot_id, ...) is created in _run_migrations,
@@ -391,6 +439,10 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     # single destination (the original behaviour); destination_id always holds
     # the primary (first) destination either way.
     _add_column_if_missing(conn, "jobs",          "destination_ids",      "TEXT")
+    # Full hyper backup destination list for random fan-out. NULL/empty means the
+    # account has a single backup channel (the original behaviour); destination_id
+    # always holds the primary (first) destination either way.
+    _add_column_if_missing(conn, "hyper_configs", "destination_ids",      "TEXT")
     # Channel extra-info columns
     for table in ("sources", "destinations"):
         _add_column_if_missing(conn, table, "username",           "TEXT")
@@ -410,6 +462,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "duplicate_scans", "last_scanned_message_id", "INTEGER DEFAULT 0")
     # Backfill last_scanned_message_id from scan items for existing completed scans
     _backfill_last_scanned_message_id(conn)
+    # Populate the per-channel-pair sync watermark from history that already exists.
+    _backfill_channel_sync_state(conn)
     _seed_missing_settings(conn, {
         "flood_buffer_min_s": "5",
         "flood_buffer_max_s": "10",
@@ -422,6 +476,9 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         "group_media":        "1",
         # Off by default — preserves the existing "always copy" behaviour
         "skip_duplicates":    "0",
+        # Kill switch for the ad-hoc code execution feature. On by default; can be
+        # turned off to disable running/enqueuing snippets entirely.
+        "adhoc_enabled":      "1",
     })
 
 
@@ -566,6 +623,81 @@ def _backfill_last_scanned_message_id(conn: sqlite3.Connection) -> None:
             )
     except Exception:
         logger.exception("Migration _backfill_last_scanned_message_id failed — skipping")
+
+
+def _backfill_channel_sync_state(conn: sqlite3.Connection) -> None:
+    """
+    Seed channel_sync_state from history that already lives in the database.
+
+    copied_messages has no FK to jobs, so it outlives a deleted job — that is the
+    record we mine here. For every full-history ('all'), single-destination job we
+    still know about, the safe watermark is the highest source_message_id below the
+    first message that *failed* to copy: only up to there was everything actually
+    delivered. We take the MAX of those per-job safe points across the same pair,
+    so the watermark never moves backwards, and never skips a message that still
+    needs retrying.
+
+    Restricted to mode='all' + single destination on purpose: an id_range or
+    date_range job, or a random fan-out to several destinations, does not mean the
+    whole 1..X range reached one specific channel, so its high id is not a safe
+    resume point.
+
+    Idempotent: re-running only ever raises a watermark to the same computed MAX.
+    """
+    try:
+        rows = conn.execute(
+            """
+            -- Per job, stop the watermark just below its first failed message;
+            -- then take the highest such safe point across all jobs on the pair.
+            SELECT source_id, destination_id,
+                   MAX(safe_id) AS watermark,
+                   MAX(last_at) AS last_at
+            FROM (
+                SELECT j.source_id      AS source_id,
+                       j.destination_id AS destination_id,
+                       CASE
+                         WHEN MIN(CASE WHEN cm.status = 'failed'
+                                       THEN cm.source_message_id END) IS NOT NULL
+                         THEN MIN(CASE WHEN cm.status = 'failed'
+                                       THEN cm.source_message_id END) - 1
+                         ELSE MAX(cm.source_message_id)
+                       END              AS safe_id,
+                       MAX(cm.processed_at) AS last_at
+                FROM jobs j
+                JOIN copied_messages cm ON cm.job_id = j.id
+                WHERE j.mode = 'all'
+                  AND (j.destination_ids IS NULL OR j.destination_ids = '')
+                  -- Only history-complete jobs: a paused/failed sharded run can
+                  -- have gaps below its MAX id, so its MAX is not a safe point.
+                  AND (j.status = 'completed' OR COALESCE(j.backfill_done, 0) = 1)
+                GROUP BY j.id, j.source_id, j.destination_id
+            )
+            WHERE safe_id > 0
+            GROUP BY source_id, destination_id
+            """
+        ).fetchall()
+        n = 0
+        for row in rows:
+            if not row["watermark"]:
+                continue
+            conn.execute(
+                """
+                INSERT INTO channel_sync_state
+                    (source_id, destination_id, last_synced_id, last_synced_at, updated_at)
+                VALUES (?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(source_id, destination_id) DO UPDATE SET
+                    last_synced_id = MAX(channel_sync_state.last_synced_id, excluded.last_synced_id),
+                    last_synced_at = COALESCE(excluded.last_synced_at, channel_sync_state.last_synced_at),
+                    updated_at     = datetime('now')
+                """,
+                (row["source_id"], row["destination_id"], row["watermark"], row["last_at"]),
+            )
+            n += 1
+        if n:
+            conn.commit()
+            logger.info("Migration: backfilled channel_sync_state for %d channel pair(s)", n)
+    except Exception:
+        logger.exception("Migration _backfill_channel_sync_state failed — skipping")
 
 
 def _migrate_copied_messages_remove_fk(conn: sqlite3.Connection) -> None:

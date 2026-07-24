@@ -599,6 +599,7 @@ def kb_settings(settings: dict[str, str]) -> InlineKeyboardMarkup:
         rows.append([_btn(f"{icon} {label}", f"cfg:{key}")])
     rows.append([_btn(texts.BTN_USERBOTS, "menu:userbots")])
     rows.append([_btn(texts.BTN_HYPER, "hyp:list")])
+    rows.append([_btn(texts.BTN_SCRIPTS, "scr:list")])
     rows.append([_btn(texts.BTN_MAIN_MENU, "menu:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -630,6 +631,7 @@ def kb_userbot_detail(ub) -> InlineKeyboardMarkup:
     else:
         rows.append([_btn(texts.BTN_ENABLE_USERBOT, f"ub:{ub.id}:enable")])
     rows.append([_btn(texts.BTN_HYPER, f"hyp:{ub.id}:menu")])
+    rows.append([_btn(texts.BTN_RUN_CODE, f"ub:{ub.id}:runmenu")])
     if not ub.is_default:
         rows.append([_btn(texts.BTN_REMOVE_USERBOT, f"ub:{ub.id}:confirm_remove")])
     rows.append([
@@ -651,6 +653,73 @@ def kb_userbot_cancel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[_btn(texts.BTN_CANCEL, "ub:cancel_login")]])
 
 
+# ── Ad-hoc code execution + script library ─────────────────────────────────────
+
+def kb_userbot_run_menu(ub_id: int) -> InlineKeyboardMarkup:
+    """The per-userbot run menu: quick run or pick a saved script."""
+    return InlineKeyboardMarkup([
+        [_btn(texts.BTN_RUN_QUICK, f"ub:{ub_id}:runquick")],
+        [_btn(texts.BTN_SCRIPTS, f"ub:{ub_id}:scripts")],
+        [_btn(texts.BTN_BACK, f"ub:{ub_id}:view")],
+    ])
+
+
+def kb_run_cancel(ub_id: int) -> InlineKeyboardMarkup:
+    """Cancel button while awaiting quick-run code for a specific account."""
+    return InlineKeyboardMarkup([[_btn(texts.BTN_CANCEL, f"ub:{ub_id}:runmenu")]])
+
+
+def kb_scripts_list(scripts: list, ub_id: int | None = None, page: int = 0) -> InlineKeyboardMarkup:
+    """
+    Two modes:
+      - ub_id set     → running context: each script runs on that account.
+      - ub_id is None → library management: each script opens its detail screen.
+    """
+    # The run context can't encode the account id in a page: callback, so it is
+    # not paginated — it shows every script. The library-management view paginates.
+    if ub_id is not None:
+        page_items, total_pages = scripts, 1
+    else:
+        page_items, total_pages = _paged(scripts, page)
+    rows = []
+    for s in page_items:
+        name = (s["name"] if isinstance(s, dict) else s.name)[:40]
+        sid = s["id"] if isinstance(s, dict) else s.id
+        if ub_id is not None:
+            rows.append([_btn(f"▶️ {name}", f"ub:{ub_id}:runscript:{sid}")])
+        else:
+            rows.append([_btn(f"📄 {name}", f"scr:{sid}:view")])
+    if total_pages > 1:
+        rows.append(_nav_row("scripts", page, total_pages))
+    if ub_id is not None:
+        rows.append([_btn(texts.BTN_SAVE_SCRIPT, "scr:new")])
+        rows.append([_btn(texts.BTN_BACK, f"ub:{ub_id}:runmenu")])
+    else:
+        rows.append([_btn(texts.BTN_SAVE_SCRIPT, "scr:new")])
+        rows.append([_btn(texts.BTN_BACK, "menu:settings"), _btn(texts.BTN_MAIN_MENU, "menu:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_script_detail(script_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_btn(texts.BTN_EDIT_SCRIPT, f"scr:{script_id}:edit")],
+        [_btn(texts.BTN_DELETE_SCRIPT, f"scr:{script_id}:confirm_delete")],
+        [_btn(texts.BTN_BACK, "scr:list")],
+    ])
+
+
+def kb_script_confirm_delete(script_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        _btn(texts.BTN_YES_DELETE_SCRIPT, f"scr:{script_id}:delete"),
+        _btn(texts.BTN_CANCEL, f"scr:{script_id}:view"),
+    ]])
+
+
+def kb_script_cancel() -> InlineKeyboardMarkup:
+    """Cancel button for the save-script flow (name → code)."""
+    return InlineKeyboardMarkup([[_btn(texts.BTN_CANCEL, "scr:list")]])
+
+
 # ── Hyper backup ───────────────────────────────────────────────────────────────
 
 def kb_hyper_account_list(userbots: list, statuses: dict) -> InlineKeyboardMarkup:
@@ -662,10 +731,15 @@ def kb_hyper_account_list(userbots: list, statuses: dict) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(rows)
 
 
-def kb_hyper_menu(acc_id: int, cfg: dict | None, dst, filters: dict) -> InlineKeyboardMarkup:
+def kb_hyper_menu(acc_id: int, cfg: dict | None, dsts: list, filters: dict) -> InlineKeyboardMarkup:
     enabled = bool(cfg and cfg["enabled"])
     rows = [[_btn("🟢 כבה הייפר" if enabled else "🔴 הפעל הייפר", f"hyp:{acc_id}:toggle")]]
-    dst_label = dst.display()[:30] if dst else "בחר ערוץ גיבוי"
+    if not dsts:
+        dst_label = "בחר ערוצי גיבוי"
+    elif len(dsts) == 1:
+        dst_label = dsts[0].display()[:30]
+    else:
+        dst_label = f"{len(dsts)} ערוצים"
     rows.append([_btn(f"📤 יעד: {dst_label}", f"hyp:{acc_id}:pickdst")])
     for mtype in texts.HYPER_TYPES:
         rows.append([_btn(texts.hyper_type_button(mtype, filters.get(mtype)), f"hyp:{acc_id}:type:{mtype}")])
@@ -700,11 +774,13 @@ def kb_hyper_type(acc_id: int, mtype: str, rule: dict | None) -> InlineKeyboardM
     return InlineKeyboardMarkup(rows)
 
 
-def kb_hyper_dst_picker(acc_id: int, dests: list) -> InlineKeyboardMarkup:
+def kb_hyper_dst_picker(acc_id: int, dests: list, selected: set | None = None) -> InlineKeyboardMarkup:
+    selected = selected or set()
     rows = []
     for d in dests:
-        rows.append([_btn(f"📤 {d.display()[:40]}", f"hyp:{acc_id}:dst:{d.id}")])
-    rows.append([_btn(texts.BTN_BACK, f"hyp:{acc_id}:menu")])
+        mark = "✅" if d.id in selected else "📤"
+        rows.append([_btn(f"{mark} {d.display()[:40]}", f"hyp:{acc_id}:dst:{d.id}")])
+    rows.append([_btn("✅ סיום", f"hyp:{acc_id}:menu")])
     return InlineKeyboardMarkup(rows)
 
 

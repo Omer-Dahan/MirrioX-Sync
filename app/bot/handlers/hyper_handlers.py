@@ -51,8 +51,10 @@ async def dispatch(bot: TelegramClient, event, uid: int) -> None:
             dest_id = int(parts[3])
         except ValueError:
             return
-        hyper_repo.set_destination(acc_id, dest_id)
-        text, kb = renderer.render_hyper_menu(acc_id)
+        # Toggle this channel in/out of the backup set and stay on the picker so
+        # several can be chosen in one go.
+        hyper_repo.toggle_destination(acc_id, dest_id)
+        text, kb = renderer.render_hyper_dst_picker(acc_id)
 
     elif action == "type" and len(parts) >= 4:
         text, kb = renderer.render_hyper_type(acc_id, parts[3])

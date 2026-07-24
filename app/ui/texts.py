@@ -181,6 +181,20 @@ TITLE_USERBOTS        = "🤖 <b>חשבונות יוזרבוט</b>"
 TITLE_USERBOT_DETAIL  = "🤖 <b>פרטי חשבון</b>"
 TITLE_ADD_USERBOT     = "🤖 <b>הוספת חשבון יוזרבוט</b>"
 
+# ── Ad-hoc code execution + script library ─────────────────────────────────────
+BTN_RUN_CODE          = "🖥 הרצת קוד / משימות"
+BTN_RUN_QUICK         = "▶️ הרצה מהירה"
+BTN_SCRIPTS           = "📚 סקריפטים שמורים"
+BTN_RUN_HISTORY       = "🕘 היסטוריית הרצות"
+BTN_SAVE_SCRIPT       = "➕ סקריפט חדש"
+BTN_EDIT_SCRIPT       = "✏️ ערוך קוד"
+BTN_DELETE_SCRIPT     = "🗑 מחק סקריפט"
+BTN_YES_DELETE_SCRIPT = "✅ כן, מחק"
+
+TITLE_RUN_MENU        = "🖥 <b>הרצת קוד / משימות</b>"
+TITLE_SCRIPTS         = "📚 <b>ספריית סקריפטים</b>"
+TITLE_SCRIPT_DETAIL   = "📄 <b>סקריפט</b>"
+
 USERBOT_STATUS_LABELS: dict[str, str] = {
     "active":       "✅ פעיל",
     "inactive":     "⏸ מושבת",
@@ -261,6 +275,73 @@ def userbot_added_text(name: str) -> str:
         f"✅ <b>החשבון נוסף בהצלחה</b>\n\n"
         f"🤖 {esc(name)}\n\n"
         "החשבון פעיל ויתחיל לקבל משימות תוך כמה שניות."
+    )
+
+
+# ── Ad-hoc code execution + script library ─────────────────────────────────────
+
+def run_menu_text(ub) -> str:
+    return (
+        f"{TITLE_RUN_MENU}\n\n"
+        f"🤖 חשבון: <b>{esc(ub.display())}</b>\n\n"
+        "הרץ קוד Python על החשבון הזה. הפלט והקבצים יחזרו אליך בהודעה נפרדת.\n\n"
+        "<i>זמינים בקוד: </i><code>client</code><i>, </i><code>me</code><i>, "
+        "</i><code>send(text)</code><i>, </i><code>send_file(file, caption=)</code><i>. "
+        "אפשר להשתמש ב-</i><code>await</code><i> ולעשות </i><code>import</code><i>.</i>"
+    )
+
+
+PROMPT_RUN_CODE = (
+    f"{TITLE_RUN_MENU}\n\n"
+    "שלח את קוד ה-Python להרצה (אפשר כמה שורות).\n\n"
+    "<i>דוגמה:</i>\n"
+    "<pre>msgs = await client.get_messages('@channel', limit=50)\n"
+    "await send(f'got {len(msgs)} messages')</pre>"
+)
+
+RUN_SENT_TEXT = (
+    "✅ <b>ההרצה נשלחה לחשבון</b>\n\n"
+    "הקוד יורץ ברגעים הקרובים והתוצאה תגיע אליך בהודעה נפרדת."
+)
+
+PROMPT_SCRIPT_NAME = (
+    f"{TITLE_SCRIPTS}\n\n"
+    "שלב 1/2 — הזן שם לסקריפט (ייחודי):"
+)
+
+PROMPT_SCRIPT_CODE = (
+    f"{TITLE_SCRIPTS}\n\n"
+    "שלב 2/2 — שלח את קוד ה-Python של הסקריפט:"
+)
+
+
+def scripts_list_text(scripts: list, ub=None) -> str:
+    target = f"\n🤖 הרצה על: <b>{esc(ub.display())}</b>\n" if ub is not None else "\n"
+    if not scripts:
+        return (
+            f"{TITLE_SCRIPTS}\n{target}\n"
+            "אין סקריפטים שמורים עדיין.\n\n"
+            "<i>שמור סקריפט כדי להריץ אותו שוב בקלות על כל חשבון.</i>"
+        )
+    return (
+        f"{TITLE_SCRIPTS}\n{target}\n"
+        f"סה\"כ: <b>{len(scripts)}</b> סקריפטים.\n"
+        "בחר סקריפט:"
+    )
+
+
+def script_detail_text(script: dict) -> str:
+    code = script.get("code") or ""
+    return (
+        f"{TITLE_SCRIPT_DETAIL}: <b>{esc(script.get('name', '?'))}</b>\n\n"
+        f"<pre>{esc(code[:2000])}</pre>"
+    )
+
+
+def script_confirm_delete_text(name: str) -> str:
+    return (
+        f"⚠️ <b>אישור מחיקת סקריפט</b>\n\n"
+        f"למחוק את הסקריפט <b>{esc(name)}</b>?"
     )
 BTN_START_SCAN             = "▶️ התחל סריקה"
 BTN_STOP_SCAN              = "⏹ עצור סריקה"
@@ -415,6 +496,18 @@ def job_detail_text(
         cfg.append(f"🔒 מוגבל לחשבונות: {allowed}")
     if job.last_processed_id:
         cfg.append(f"🔖 נקודת המשך: #{job.last_processed_id}")
+    # Durable per-pair watermark: shown for single-destination jobs so it is clear,
+    # even after the queue was cleared, how far this channel pair is already synced.
+    dest_list = job.destination_id_list()
+    if len(dest_list) == 1:
+        from app.repositories import channel_sync_repo
+
+        state = channel_sync_repo.get(job.source_id, dest_list[0])
+        if state and state.get("last_synced_id"):
+            synced_line = f"🛰️ סונכרן עד #{state['last_synced_id']}"
+            if state.get("last_synced_at"):
+                synced_line += f" · {_fmt_dt(state['last_synced_at'])}"
+            cfg.append(synced_line)
     cfg.append(f"🕒 התחלה: {_fmt_dt(job.started_at)}")
     cfg.append(f"🔄 עדכון אחרון: {_fmt_dt(job.last_updated_at)}")
     if job.completed_at:
@@ -1203,24 +1296,36 @@ def hyper_account_list_text(userbots: list, statuses: dict) -> str:
     )
 
 
-def hyper_menu_text(ub, cfg: "dict | None", dst, queued: int = 0) -> str:
+def hyper_menu_text(ub, cfg: "dict | None", dsts: "list | None", queued: int = 0) -> str:
     enabled = bool(cfg and cfg["enabled"])
     status = "🟢 פעיל" if enabled else "🔴 כבוי"
-    dst_line = dst.display() if dst else "<i>לא נבחר</i>"
+    dsts = dsts or []
+    if not dsts:
+        dst_line = "<i>לא נבחר</i>"
+        dst_label = "ערוץ גיבוי"
+    elif len(dsts) == 1:
+        dst_line = esc(dsts[0].display())
+        dst_label = "ערוץ גיבוי"
+    else:
+        dst_line = esc(" · ".join(d.display() for d in dsts))
+        dst_label = f"ערוצי גיבוי ({len(dsts)})"
     copied = (cfg or {}).get("copied_count", 0)
     skipped = (cfg or {}).get("skipped_count", 0)
     failed = (cfg or {}).get("failed_count", 0)
     warn = ""
-    if enabled and not dst:
+    if enabled and not dsts:
         warn = "\n\n⚠️ בחר ערוץ גיבוי כדי שהמצב יתחיל לפעול."
     queue_line = f"\n⏳ בתור להמשך: <b>{queued}</b> (ממתין למכסה/שליחה)" if queued else ""
+    fanout_note = (
+        "לאחד מערוצי הגיבוי (בפיזור אקראי)" if len(dsts) > 1 else "לערוץ הגיבוי"
+    )
     return (
         f"{TITLE_HYPER}\n\n"
         f"חשבון: <b>{esc(ub.display())}</b>\n"
         f"סטטוס: <b>{status}</b>\n"
-        f"ערוץ גיבוי: {esc(dst_line) if dst else dst_line}\n\n"
+        f"{dst_label}: {dst_line}\n\n"
         "<i>המצב מגבה אוטומטית כל קובץ/מדיה שהחשבון הזה מעלה, בכל צ׳אט, "
-        "לערוץ הגיבוי — עם סינון חכם ובלי כפילויות.</i>\n\n"
+        f"{fanout_note} — עם סינון חכם ובלי כפילויות.</i>\n\n"
         f"📊 גובו: <b>{copied}</b> | דולגו: <b>{skipped}</b> | נכשלו: <b>{failed}</b>"
         f"{queue_line}"
         f"{warn}"
@@ -1253,8 +1358,10 @@ def hyper_dst_picker_text(ub) -> str:
     return (
         f"{TITLE_HYPER}\n\n"
         f"חשבון: <b>{esc(ub.display())}</b>\n\n"
-        "בחר ערוץ גיבוי מתוך היעדים הקיימים:\n"
-        "<i>(כדי להוסיף ערוץ חדש — הוסף אותו תחילה במסך היעדים)</i>"
+        "בחר ערוץ גיבוי אחד או יותר מתוך היעדים הקיימים:\n"
+        "<i>✅ = נבחר. הקש שוב כדי להסיר. כשנבחרים כמה ערוצים — כל קובץ מגובה "
+        "לאחד מהם באקראי (המערכת מתעלמת מהשליחות לערוצי הגיבוי כדי לא ליצור לופ).\n"
+        "כדי להוסיף ערוץ חדש — הוסף אותו תחילה במסך היעדים.</i>"
     )
 
 

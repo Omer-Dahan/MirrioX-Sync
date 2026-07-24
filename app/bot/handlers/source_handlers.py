@@ -144,7 +144,8 @@ async def _dispatch_dst_action(bot: TelegramClient, uid: int, dst_id: int, actio
     elif action == "delete":
         if source_repo.is_destination_in_use(dst_id):
             text, kb = renderer.render_error(
-                "לא ניתן למחוק יעד שמשויך למשימות קיימות.\nמחק את המשימות הקשורות תחילה.",
+                "לא ניתן למחוק יעד שמשויך למשימות קיימות או לגיבוי Hyper.\n"
+                "הסר אותו מהמשימות ומהגדרות ה-Hyper תחילה.",
                 back_target="destinations",
             )
         else:

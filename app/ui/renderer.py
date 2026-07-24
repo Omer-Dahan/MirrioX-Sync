@@ -199,6 +199,53 @@ def render_userbot_confirm_remove(userbot_id: int) -> tuple[str, InlineKeyboardM
     )
 
 
+def render_userbot_run_menu(userbot_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    from app.repositories import userbot_repo
+    ub = userbot_repo.get_by_id(userbot_id)
+    if ub is None:
+        return texts.error_text("חשבון לא נמצא"), keyboards.kb_error_back("userbots")
+    return texts.run_menu_text(ub), keyboards.kb_userbot_run_menu(userbot_id)
+
+
+def render_scripts_for_userbot(userbot_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Script library shown in the context of running on a specific account."""
+    from app.repositories import userbot_repo, script_repo
+    ub = userbot_repo.get_by_id(userbot_id)
+    if ub is None:
+        return texts.error_text("חשבון לא נמצא"), keyboards.kb_error_back("userbots")
+    scripts = script_repo.list_scripts()
+    return (
+        texts.scripts_list_text(scripts, ub=ub),
+        keyboards.kb_scripts_list(scripts, ub_id=userbot_id, page=page),
+    )
+
+
+def render_scripts_list(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Global script library management (reached from Settings)."""
+    from app.repositories import script_repo
+    scripts = script_repo.list_scripts()
+    return texts.scripts_list_text(scripts), keyboards.kb_scripts_list(scripts, page=page)
+
+
+def render_script_detail(script_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    from app.repositories import script_repo
+    script = script_repo.get_script(script_id)
+    if script is None:
+        return texts.error_text("סקריפט לא נמצא"), keyboards.kb_error_back("settings")
+    return texts.script_detail_text(script), keyboards.kb_script_detail(script_id)
+
+
+def render_script_confirm_delete(script_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    from app.repositories import script_repo
+    script = script_repo.get_script(script_id)
+    if script is None:
+        return texts.error_text("סקריפט לא נמצא"), keyboards.kb_error_back("settings")
+    return (
+        texts.script_confirm_delete_text(script["name"]),
+        keyboards.kb_script_confirm_delete(script_id),
+    )
+
+
 def render_hyper_account_list() -> tuple[str, InlineKeyboardMarkup]:
     from app.repositories import userbot_repo, hyper_repo
     userbots = userbot_repo.get_all()
@@ -217,11 +264,13 @@ def render_hyper_menu(acc_id: int) -> tuple[str, InlineKeyboardMarkup]:
     hyper_repo.ensure_config(acc_id)
     cfg = hyper_repo.get_config(acc_id)
     filters = hyper_repo.get_filters(acc_id)
-    dst = None
-    if cfg and cfg.get("destination_id"):
-        dst = source_repo.get_destination_by_id(cfg["destination_id"])
+    dsts = []
+    for dest_id in hyper_repo.get_destination_ids(acc_id):
+        rec = source_repo.get_destination_by_id(dest_id)
+        if rec is not None:
+            dsts.append(rec)
     queued = hyper_repo.queue_count(acc_id)
-    return texts.hyper_menu_text(ub, cfg, dst, queued), keyboards.kb_hyper_menu(acc_id, cfg, dst, filters)
+    return texts.hyper_menu_text(ub, cfg, dsts, queued), keyboards.kb_hyper_menu(acc_id, cfg, dsts, filters)
 
 
 def render_hyper_type(acc_id: int, media_type: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -234,12 +283,13 @@ def render_hyper_type(acc_id: int, media_type: str) -> tuple[str, InlineKeyboard
 
 
 def render_hyper_dst_picker(acc_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    from app.repositories import userbot_repo
+    from app.repositories import userbot_repo, hyper_repo
     ub = userbot_repo.get_by_id(acc_id)
     if ub is None:
         return texts.error_text("חשבון לא נמצא"), keyboards.kb_error_back("userbots")
     dests = source_repo.get_all_destinations()
-    return texts.hyper_dst_picker_text(ub), keyboards.kb_hyper_dst_picker(acc_id, dests)
+    selected = set(hyper_repo.get_destination_ids(acc_id))
+    return texts.hyper_dst_picker_text(ub), keyboards.kb_hyper_dst_picker(acc_id, dests, selected)
 
 
 def render_transfer_stats() -> tuple[str, InlineKeyboardMarkup]:

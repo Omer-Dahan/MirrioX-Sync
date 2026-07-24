@@ -58,14 +58,58 @@ def set_enabled(userbot_id: int, enabled: bool) -> None:
     conn.commit()
 
 
-def set_destination(userbot_id: int, destination_id: Optional[int]) -> None:
-    ensure_config(userbot_id)
+def dest_ids_from_config(cfg: Optional[dict]) -> list[int]:
+    """
+    Parse a config row into its backup destination id list, primary first.
+
+    Falls back to the single legacy destination_id column when the list column is
+    NULL/empty, so a config written before multi-destination behaves exactly as
+    before.
+    """
+    if not cfg:
+        return []
+    raw = cfg.get("destination_ids")
+    if raw:
+        ids = [int(p) for p in str(raw).split(",") if p.strip()]
+        if ids:
+            return ids
+    did = cfg.get("destination_id")
+    return [did] if did else []
+
+
+def get_destination_ids(userbot_id: int) -> list[int]:
+    """All hyper backup destination ids for this account, primary first."""
+    return dest_ids_from_config(get_config(userbot_id))
+
+
+def _write_destinations(userbot_id: int, ids: list[int]) -> None:
+    """Persist the destination list, keeping destination_id = the first entry."""
+    primary = ids[0] if ids else None
+    joined = ",".join(str(i) for i in ids) if ids else None
     conn = db.get_connection()
     conn.execute(
-        "UPDATE hyper_configs SET destination_id = ?, updated_at = datetime('now') WHERE userbot_id = ?",
-        (destination_id, userbot_id),
+        "UPDATE hyper_configs SET destination_id = ?, destination_ids = ?, "
+        "updated_at = datetime('now') WHERE userbot_id = ?",
+        (primary, joined, userbot_id),
     )
     conn.commit()
+
+
+def set_destination(userbot_id: int, destination_id: Optional[int]) -> None:
+    """Replace the whole backup destination list with a single channel (or clear)."""
+    ensure_config(userbot_id)
+    _write_destinations(userbot_id, [destination_id] if destination_id else [])
+
+
+def toggle_destination(userbot_id: int, dest_id: int) -> None:
+    """Add or remove one backup destination. Order-preserving; primary = first."""
+    ensure_config(userbot_id)
+    ids = get_destination_ids(userbot_id)
+    if dest_id in ids:
+        ids = [i for i in ids if i != dest_id]
+    else:
+        ids = ids + [dest_id]
+    _write_destinations(userbot_id, ids)
 
 
 def add_progress(userbot_id: int, copied: int = 0, skipped: int = 0, failed: int = 0) -> None:

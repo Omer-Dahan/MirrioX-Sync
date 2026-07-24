@@ -18,7 +18,7 @@ from telethon import TelegramClient
 
 from app.config import Config
 from app.network_errors import is_network_error
-from app.repositories import job_repo, state_repo, scan_repo, userbot_repo
+from app.repositories import job_repo, state_repo, scan_repo, userbot_repo, script_repo
 from app.worker.scan_engine import ScanEngine
 from app.worker.telegram_utils import get_entity_safe
 
@@ -242,6 +242,12 @@ def _startup_recovery() -> None:
     stuck_scans = scan_repo.reset_running_scans_to_pending()
     if stuck_scans:
         logger.info("Recovery: reset %d stuck scan(s) back to pending", stuck_scans)
+
+    # Ad-hoc tasks stuck 'running' are marked as errored, not retried: a snippet may
+    # have side effects, so re-running an interrupted task could duplicate them.
+    stuck_tasks = script_repo.reset_running_tasks_to_error("הופסק עקב הפעלה מחדש של ה-worker")
+    if stuck_tasks:
+        logger.info("Recovery: marked %d interrupted ad-hoc task(s) as error", stuck_tasks)
 
     if recovered:
         logger.info("Recovery: re-queued %d job(s)", recovered)
@@ -491,6 +497,64 @@ async def send_delete_completion_notification(
     from app.bot.bot_main import send_notification
     await send_notification(chat_id, text)
     logger.info("Delete job #%d: completion notification sent", delete_job_id)
+
+
+async def send_task_completion_notification(task_id: int) -> None:
+    """Send the result of an ad-hoc code task back to the admin via the control bot."""
+    task = script_repo.get_task(task_id)
+    if not task:
+        return
+
+    from app.repositories import userbot_repo as _ub_repo
+    from app.ui.texts import esc
+
+    ub = _ub_repo.get_by_id(task["userbot_id"])
+    label = esc(ub.display()) if ub else f"#{task['userbot_id']}"
+
+    if task.get("status") == "done":
+        header = "✅ <b>הרצת קוד הושלמה</b>"
+    else:
+        header = "❌ <b>הרצת קוד נכשלה</b>"
+
+    # Escape first, then trim to fit: esc() expands &, <, > (one char → up to five),
+    # so trimming the raw output could still blow past Telegram's 4096-char cap once
+    # escaped — and an over-long message is silently dropped by send_notification.
+    body = esc(task.get("output") or "(אין פלט)")
+    frame = (
+        f"{header}\n\n"
+        f"🤖 חשבון: <b>{label}</b>\n"
+        f"🆔 משימה: <code>#{task['id']}</code>\n\n"
+        f"<pre></pre>"
+    )
+    budget = 4096 - len(frame) - 20  # small safety margin for the truncation note
+    if len(body) > budget:
+        body = body[:budget]
+        # Never cut mid-entity (e.g. inside "&lt;") — Telegram would reject the whole
+        # message. Back off to before any dangling '&' with no matching ';'.
+        amp = body.rfind("&")
+        if amp > body.rfind(";"):
+            body = body[:amp]
+        body += "\n…(פלט נחתך)"
+
+    text = (
+        f"{header}\n\n"
+        f"🤖 חשבון: <b>{label}</b>\n"
+        f"🆔 משימה: <code>#{task['id']}</code>\n\n"
+        f"<pre>{body}</pre>"
+    )
+
+    chat_id_str = task.get("chat_id")
+    if chat_id_str in (None, ""):
+        chat_id_str = state_repo.get_setting("main_chat_id")
+    if not chat_id_str:
+        return
+    try:
+        chat_id = int(chat_id_str)
+    except (ValueError, TypeError):
+        return
+    from app.bot.bot_main import send_notification
+    await send_notification(chat_id, text)
+    logger.info("Ad-hoc task #%d: completion notification sent", task_id)
 
 
 def account_is_capped(userbot_id: int) -> bool:

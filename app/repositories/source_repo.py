@@ -237,6 +237,18 @@ def is_destination_in_use(dest_id: int) -> bool:
         "AND ',' || destination_ids || ',' LIKE '%,' || ? || ',%') LIMIT 1",
         (dest_id, str(dest_id)),
     ).fetchone()
+    if row is not None:
+        return True
+    # Also referenced as a hyper backup target? Deleting the row would leave those
+    # configs pointing at a channel that no longer exists — the live listener's
+    # random fan-out could then pick a missing destination and silently drop the
+    # message. Block the delete here rather than trying to unwire every config.
+    row = conn.execute(
+        "SELECT 1 FROM hyper_configs WHERE destination_id = ? "
+        "OR (destination_ids IS NOT NULL "
+        "AND ',' || destination_ids || ',' LIKE '%,' || ? || ',%') LIMIT 1",
+        (dest_id, str(dest_id)),
+    ).fetchone()
     return row is not None
 
 

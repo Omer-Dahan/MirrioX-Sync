@@ -11,9 +11,9 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 from app.config import Config
-from app.repositories import admin_repo
+from app.repositories import admin_repo, state_repo
 from app.bot import state as _state
-from app.bot.handlers._common import update_main_message
+from app.bot.handlers._common import update_main_message, answer_callback
 from app.ui import keyboards, renderer
 from app.ui.keyboards import to_telethon
 
@@ -72,6 +72,19 @@ def _get_uid(event) -> int:
     return event.sender_id
 
 
+def _restore_panel(chat_id: str | None, msg_id: str | None) -> None:
+    """Undo a panel adoption whose edit turned out to fail.
+
+    update_main_message() clears the stored coordinates when the message is
+    dead. If we had just adopted the clicked message, the previously known
+    panel may still be alive, so put it back rather than leaving the bot with
+    no panel at all.
+    """
+    if chat_id and msg_id:
+        state_repo.set_setting("main_message_id", msg_id)
+        state_repo.set_setting("main_chat_id", chat_id)
+
+
 # ── Auto-refresh ───────────────────────────────────────────────────────────────
 
 async def _auto_refresh_loop(bot: TelegramClient) -> None:
@@ -85,6 +98,9 @@ async def _auto_refresh_loop(bot: TelegramClient) -> None:
             continue
         try:
             text, kb = renderer.render_main_menu()
+            # A False result means the panel is gone and its coordinates were
+            # cleared; on_main_screen is now False, so the loop goes quiet
+            # until the next /start instead of retrying a dead id every 30s.
             await update_main_message(bot, text, to_telethon(kb))
         except Exception as e:
             logger.debug("Auto-refresh failed: %s", e)
@@ -137,10 +153,25 @@ async def run_async(config: Config) -> None:
             ud.pop("run_userbot_id", None)
 
         try:
+            # Sync the active panel to the one the user just interacted with, so
+            # clicking an older panel adopts it instead of updating a different
+            # one. The previous coordinates are kept so a failed edit can roll
+            # back: without that, clicking a deleted ghost panel writes a dead
+            # message id into the DB and freezes the live panel as well.
+            prev_msg_id = state_repo.get_setting("main_message_id")
+            prev_chat_id = state_repo.get_setting("main_chat_id")
+            adopted = False
+            if getattr(event, "message_id", None) and str(event.message_id) != prev_msg_id:
+                state_repo.set_setting("main_message_id", str(event.message_id))
+                state_repo.set_setting("main_chat_id", str(event.chat_id))
+                adopted = True
+
             if data == "menu:main":
-                await event.answer()
+                await answer_callback(event)
                 text, kb = renderer.render_main_menu()
-                await update_main_message(bot, text, to_telethon(kb))
+                ok = await update_main_message(bot, text, to_telethon(kb))
+                if not ok and adopted:
+                    _restore_panel(prev_chat_id, prev_msg_id)
 
             elif data.startswith("page:"):
                 await _handle_paging(bot, event, data)
@@ -187,16 +218,18 @@ async def run_async(config: Config) -> None:
                 await script_handlers.dispatch(bot, event, uid)
 
             elif data == "menu:stats":
-                await event.answer()
+                await answer_callback(event)
                 text, kb = renderer.render_transfer_stats()
-                await update_main_message(bot, text, to_telethon(kb))
+                ok = await update_main_message(bot, text, to_telethon(kb))
+                if not ok and adopted:
+                    _restore_panel(prev_chat_id, prev_msg_id)
 
             elif data.startswith("scan:") or data == "menu:scan":
                 from app.bot.handlers import scan_handlers
                 await scan_handlers.dispatch_scan(bot, event, uid)
 
             else:
-                await event.answer()
+                await answer_callback(event)
                 logger.warning("Unhandled callback data: %s", data)
 
         except Exception as e:
@@ -291,7 +324,7 @@ async def run_async(config: Config) -> None:
 # ── Paging helper ──────────────────────────────────────────────────────────────
 
 async def _handle_paging(bot: TelegramClient, event, data: str) -> None:
-    await event.answer()
+    await answer_callback(event)
     parts = data.split(":")
     if len(parts) != 3:
         return

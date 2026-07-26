@@ -1,6 +1,7 @@
 """Handles the /start command. Shows the main control message."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from telethon import TelegramClient
 from telethon.errors import MessageNotModifiedError
@@ -13,6 +14,12 @@ from app.ui.keyboards import to_telethon
 
 logger = logging.getLogger(__name__)
 
+# Serialises panel creation. Two /start commands arriving close together (easy
+# when a slow edit makes the user tap again) would otherwise both find the old
+# panel unusable, both send a new one, and both delete the old id — leaving the
+# DB pointing at a message one of them just deleted.
+_start_lock = asyncio.Lock()
+
 
 async def start_command(bot: TelegramClient, event) -> None:
     """Show the main control message.
@@ -23,6 +30,12 @@ async def start_command(bot: TelegramClient, event) -> None:
     blink out. The incoming /start command message is removed to keep the
     chat clean.
     """
+    async with _start_lock:
+        await _start_command_locked(bot, event)
+
+
+async def _start_command_locked(bot: TelegramClient, event) -> None:
+    """Body of start_command; runs under _start_lock."""
     uid = event.sender_id
     chat_id = event.chat_id
 
@@ -79,8 +92,10 @@ async def start_command(bot: TelegramClient, event) -> None:
     state_repo.set_setting("main_chat_id", str(chat_id))
     state_repo.set_setting("main_message_id", str(msg.id))
 
-    # Delete the old message only after the new one is successfully stored
-    if old_msg_id_str and old_chat_id_str:
+    # Delete the old message only after the new one is successfully stored, and
+    # never delete the panel we just registered — guards against removing the
+    # live panel if the stored id changed while we were sending.
+    if old_msg_id_str and old_chat_id_str and old_msg_id_str != str(msg.id):
         try:
             await bot.delete_messages(int(old_chat_id_str), int(old_msg_id_str))
         except Exception:

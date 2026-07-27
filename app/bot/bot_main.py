@@ -13,7 +13,11 @@ from telethon.sessions import StringSession
 from app.config import Config
 from app.repositories import admin_repo, state_repo
 from app.bot import state as _state
-from app.bot.handlers._common import update_main_message, answer_callback
+from app.bot.handlers._common import (
+    update_main_message,
+    answer_callback,
+    edits_are_rate_limited,
+)
 from app.ui import keyboards, renderer
 from app.ui.keyboards import to_telethon
 
@@ -85,10 +89,46 @@ def _restore_panel(chat_id: str | None, msg_id: str | None) -> None:
         state_repo.set_setting("main_chat_id", chat_id)
 
 
+# ── Latency instrumentation ────────────────────────────────────────────────────
+
+# A callback slower than this is logged with its timing breakdown. Telegram
+# expires a callback query after ~15s, so anything near that already means the
+# user saw a dead button.
+_SLOW_CALLBACK_S = 3.0
+
+# How far behind schedule the watchdog's own sleep may run before it reports.
+# The loop is shared with the worker, so a stall here means the worker blocked
+# it — and every button press queued behind that block.
+_LOOP_STALL_S = 2.0
+
+
+async def _loop_stall_watchdog() -> None:
+    """Report when the shared event loop stops running on time.
+
+    The bot and worker live in one event loop, so a synchronous or long-awaited
+    operation in the worker delays every callback the bot is trying to answer.
+    That delay is invisible in the handler's own timing — it happens before the
+    handler is even scheduled — so it is measured here instead: sleep a known
+    interval and log however much longer it actually took.
+    """
+    interval = 1.0
+    while True:
+        before = asyncio.get_running_loop().time()
+        await asyncio.sleep(interval)
+        drift = asyncio.get_running_loop().time() - before - interval
+        if drift >= _LOOP_STALL_S:
+            logger.warning(
+                "Event loop stalled %.1fs (shared with worker) — "
+                "button presses during this window were queued, not lost",
+                drift,
+            )
+
+
 # ── Auto-refresh ───────────────────────────────────────────────────────────────
 
 async def _auto_refresh_loop(bot: TelegramClient) -> None:
     """Periodically refresh the main menu while the main screen is visible."""
+    last_text: str | None = None
     while True:
         await asyncio.sleep(_AUTO_REFRESH_INTERVAL_S)
         if not _state._bot_data.get("on_main_screen", False):
@@ -96,8 +136,17 @@ async def _auto_refresh_loop(bot: TelegramClient) -> None:
         from app.repositories import job_repo
         if job_repo.get_active_job() is None:
             continue
+        if edits_are_rate_limited():
+            continue  # Telegram is throttling panel edits — don't add to the queue
         try:
             text, kb = renderer.render_main_menu()
+            # Skip an edit that would change nothing. A long-running job can hold
+            # the panel identical for many cycles, and every one of those edits
+            # counted against Telegram's per-message edit limit for no benefit —
+            # which is what pushed the panel into FloodWait in the first place.
+            if text == last_text:
+                continue
+            last_text = text
             # A False result means the panel is gone and its coordinates were
             # cleared; on_main_screen is now False, so the loop goes quiet
             # until the next /start instead of retrying a dead id every 30s.
@@ -116,6 +165,14 @@ async def run_async(config: Config) -> None:
         StringSession(),          # ephemeral session — bot token auth needs no file
         config.TELETHON_API_ID,
         config.TELETHON_API_HASH,
+        # Telethon's default (60) makes it swallow any FloodWait under a minute
+        # and sleep inside the call — silently, with no exception and no log. A
+        # panel edit that hits Telegram's per-message edit limit would block the
+        # whole handler for up to 60s, long past the ~15s at which Telegram
+        # expires the callback query, so the button looked dead or answered very
+        # late. 0 makes the error surface immediately, where it can be logged and
+        # returned from. Matches the worker's client (see userbot_manager).
+        flood_sleep_threshold=0,
     )
 
     _state._bot_data["admin_ids"] = config.ADMIN_IDS
@@ -141,6 +198,20 @@ async def run_async(config: Config) -> None:
             return
         data = event.data.decode()
         _state._bot_data["on_main_screen"] = (data == "menu:main")
+
+        # Timing baseline. `age` is how long the press sat before this handler ran
+        # — it comes from Telegram's own timestamp on the button press, so it
+        # captures queueing in the shared event loop that the handler itself
+        # cannot see. `t0` measures the handler's own work.
+        t0 = asyncio.get_running_loop().time()
+        press_age = None
+        msg_date = getattr(getattr(event, "query", None), "date", None) or getattr(event, "date", None)
+        if msg_date is not None:
+            try:
+                from datetime import datetime, timezone
+                press_age = (datetime.now(timezone.utc) - msg_date).total_seconds()
+            except Exception:
+                press_age = None
 
         # A pending quick-run code prompt is only ever answered by a text message.
         # Any button press means the admin navigated away (cancel, back, another
@@ -240,6 +311,22 @@ async def run_async(config: Config) -> None:
             except Exception:
                 pass
 
+        finally:
+            # Split the delay into "waited to be scheduled" vs "spent working".
+            # A large press_age with a small handler time means the loop was
+            # blocked elsewhere (the worker); the reverse means this handler's
+            # own DB query or Telegram call is the slow part.
+            handler_s = asyncio.get_running_loop().time() - t0
+            if handler_s >= _SLOW_CALLBACK_S or (press_age or 0) >= _SLOW_CALLBACK_S:
+                logger.warning(
+                    "Slow callback %s: waited %s before dispatch, %.1fs in handler",
+                    data,
+                    "%.1fs" % press_age if press_age is not None else "unknown",
+                    handler_s,
+                )
+            else:
+                logger.debug("Callback %s handled in %.2fs", data, handler_s)
+
     # ── Text input dispatcher ──────────────────────────────────────────────────
 
     @bot.on(events.NewMessage(
@@ -310,6 +397,8 @@ async def run_async(config: Config) -> None:
 
     # Start auto-refresh background task
     refresh_task = asyncio.create_task(_auto_refresh_loop(bot))
+    # Reports when the worker blocks the shared loop and delays button handling.
+    watchdog_task = asyncio.create_task(_loop_stall_watchdog())
 
     try:
         await asyncio.Event().wait()  # Run forever until cancelled
@@ -317,6 +406,7 @@ async def run_async(config: Config) -> None:
         pass
     finally:
         refresh_task.cancel()
+        watchdog_task.cancel()
         await bot.disconnect()
         logger.info("Management bot disconnected")
 

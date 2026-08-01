@@ -454,6 +454,10 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, table, "photos_count",       "INTEGER")
         _add_column_if_missing(conn, table, "videos_count",       "INTEGER")
         _add_column_if_missing(conn, table, "docs_count",         "INTEGER")
+        # Does the channel block forwarding (Telegram's "restrict saving content")?
+        # NULL = not established yet, 0 = open, 1 = protected. Filled in when the
+        # channel is resolved, and corrected the moment a copy is actually refused.
+        _add_column_if_missing(conn, table, "forwards_restricted", "INTEGER")
     # duplicate_scans: rebuild table if old source_id NOT NULL constraint exists
     _migrate_duplicate_scans(conn)
     # delete_scan_jobs: rebuild table if old source_id NOT NULL column exists
@@ -472,10 +476,23 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         "batch_pause_min_s":  "60",
         "batch_pause_max_s":  "120",
         "flood_inline_max_s": "60",
-        "dest_min_delay_ms":  "1000",
+        # Aggregate ceiling per destination channel. Several accounts copying the
+        # same job to the same channel share this gate, so it is what actually
+        # bounds what one channel receives per hour.
+        "dest_min_delay_ms":  "2500",
         "group_media":        "1",
         # Off by default — preserves the existing "always copy" behaviour
         "skip_duplicates":    "0",
+        # Pause between two channel access probes. These are the most
+        # FloodWait-prone calls the worker makes, and they used to run back to
+        # back on every account at once.
+        "channel_check_delay_ms": "3000",
+        # A protected source is copied by file reference, which moves no bytes.
+        # Download+re-upload is the emergency route and stays off unless asked
+        # for: a job that falls into it silently crawls for hours.
+        "allow_download_upload": "0",
+        # Ceiling for that emergency route, in MB.
+        "max_download_mb":    "2048",
         # Kill switch for the ad-hoc code execution feature. On by default; can be
         # turned off to disable running/enqueuing snippets entirely.
         "adhoc_enabled":      "1",

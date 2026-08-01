@@ -1,0 +1,8 @@
+# Development-only dependencies. Kept out of requirements.txt so a production
+# install stays limited to what the worker and bot actually run on.
+#
+#   venv\Scripts\activate
+#   pip install -r requirements.txt -r requirements-dev.txt
+-r requirements.txt
+pytest==9.1.1
+pylint==4.0.5

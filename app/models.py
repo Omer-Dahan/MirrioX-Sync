@@ -24,6 +24,19 @@ def _parse_id_set(raw: Optional[str]) -> set[int]:
     return out
 
 
+def _optional_bool(row: sqlite3.Row, keys, column: str) -> Optional[bool]:
+    """
+    Read a tri-state INTEGER column: None (unknown), True or False.
+
+    Unlike the plain `bool(...)` used for settled flags, NULL is preserved here —
+    "we have not established this yet" is different from "no".
+    """
+    if column not in keys:
+        return None
+    value = row[column]
+    return None if value is None else bool(value)
+
+
 @dataclass
 class Admin:
     id: int
@@ -61,6 +74,8 @@ class Source:
     photos_count: Optional[int] = None
     videos_count: Optional[int] = None
     docs_count: Optional[int] = None
+    # None until established: the channel blocks forwarding (protected content).
+    forwards_restricted: Optional[bool] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Source":
@@ -82,6 +97,7 @@ class Source:
             photos_count=row["photos_count"] if "photos_count" in keys else None,
             videos_count=row["videos_count"] if "videos_count" in keys else None,
             docs_count=row["docs_count"] if "docs_count" in keys else None,
+            forwards_restricted=_optional_bool(row, keys, "forwards_restricted"),
         )
 
     def display(self) -> str:
@@ -109,6 +125,8 @@ class Destination:
     photos_count: Optional[int] = None
     videos_count: Optional[int] = None
     docs_count: Optional[int] = None
+    # None until established: the channel blocks forwarding (protected content).
+    forwards_restricted: Optional[bool] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Destination":
@@ -130,6 +148,7 @@ class Destination:
             photos_count=row["photos_count"] if "photos_count" in keys else None,
             videos_count=row["videos_count"] if "videos_count" in keys else None,
             docs_count=row["docs_count"] if "docs_count" in keys else None,
+            forwards_restricted=_optional_bool(row, keys, "forwards_restricted"),
         )
 
     def display(self) -> str:

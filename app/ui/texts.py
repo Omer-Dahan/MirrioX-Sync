@@ -1087,6 +1087,8 @@ def _channel_extra_lines(ch) -> str:
         if ch.verified:
             lines += " ✅ מאומת"
         lines += "\n"
+    if ch.forwards_restricted:
+        lines += "🔒 הערוץ חוסם העברה (תוכן מוגן)\n"
     if ch.username:
         lines += f"@: @{esc(ch.username)}\n"
     if ch.participants_count is not None:
@@ -1165,6 +1167,8 @@ SETTINGS_LABELS: dict[str, str] = {
     "flood_buffer_max_s":   "כיסוי FloodWait מקסימלי (שניות)",
     "flood_inline_max_s":   "בליעת FloodWait במקום עד (שניות)",
     "dest_min_delay_ms":    "עיכוב מינימלי לערוץ יעד (מ\"ש)",
+    "channel_check_delay_ms": "עיכוב בין בדיקות גישה לערוץ (מ\"ש)",
+    "max_download_mb":      "תקרת הורדה לקובץ (MB)",
     "max_retries":          "מקסימום ניסיונות חוזרים",
     "heartbeat_interval_s": "מרווח דופק עובד (שניות)",
 }
@@ -1172,13 +1176,18 @@ SETTINGS_LABELS: dict[str, str] = {
 TOGGLE_SETTINGS: dict[str, str] = {
     "group_media":     "קיבוץ תמונות/סרטונים לאלבום (עד 10)",
     "skip_duplicates": "דלג על כפילויות (אל תשלח תוכן שכבר נשלח ליעד)",
+    "allow_download_upload": "אפשר הורדה והעלאה כמסלול חירום (איטי)",
 }
 
 EDITABLE_SETTINGS = list(SETTINGS_LABELS.keys())
 
 # Toggles that default to OFF when the setting row is missing.
 # Everything else defaults to ON, preserving the original behaviour.
-TOGGLE_DEFAULT_OFF: frozenset[str] = frozenset({"skip_duplicates"})
+#
+# allow_download_upload is off on purpose: a protected source is copied by file
+# reference, which moves no bytes at all. Download+re-upload only makes sense as
+# a rare emergency, and a job that slipped into it silently crawled for hours.
+TOGGLE_DEFAULT_OFF: frozenset[str] = frozenset({"skip_duplicates", "allow_download_upload"})
 
 
 def toggle_is_on(settings: dict[str, str], key: str) -> bool:

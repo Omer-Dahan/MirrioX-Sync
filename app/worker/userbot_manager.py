@@ -50,9 +50,11 @@ logger = logging.getLogger(__name__)
 _LISTENER_RECONCILE_EVERY_S = 30
 # Safety bound so a bad DB state can never spin the claim loop.
 _MAX_CONTINUOUS_CLAIMS_PER_CYCLE = 10
-# Floor between channel access checks while a runner is busy copying, so the
-# per-message callback can't turn into a query per message.
-_CHANNEL_CHECK_EVERY_S = 10
+# Floor between channel access checks. A probe is several resolve-family calls,
+# the most FloodWait-prone thing a runner does, and both the idle loop and the
+# per-message callback ask for one — so the floor has to be wide enough that a
+# newly added channel is still picked up promptly without probing on a loop.
+_CHANNEL_CHECK_EVERY_S = 60
 # How many parked hyper backups a runner drains per poll cycle, and how many
 # times a single item is retried before it is given up on.
 _HYPER_DRAIN_PER_CYCLE = 20
@@ -103,6 +105,17 @@ class UserbotRunner:
         self._live_lock = asyncio.Lock()          # serialises live sends on this account
         self._last_reconcile = 0.0
         self._last_channel_check = 0.0
+        # The poll loop and the copy engine's per-message callback both ask for a
+        # channel check, and a probe outlives the interval that gates it — so the
+        # two overlapped and the same channel was probed twice seconds apart.
+        self._channel_check_lock = asyncio.Lock()
+        # Loop-time until which Telegram has told this account to stop probing.
+        self._channel_flood_until = 0.0
+        # Last UI refresh request this runner has already acted on. Every runner
+        # tracks its own, because every account has to re-probe: a single shared
+        # Event was cleared by whichever runner saw it first and the rest never
+        # heard about the refresh at all.
+        self._resolve_seen = 0
         self._capped_logged = False
 
     @property
@@ -167,25 +180,58 @@ class UserbotRunner:
                 pass
 
     async def _resolve_if_needed(self) -> None:
-        """Passed to CopyEngine: keep checking channels even while this account is busy."""
-        await self._check_channels()
+        """
+        Passed to CopyEngine: keep checking channels even while this account is busy.
 
-    async def _check_channels(self, force: bool = False) -> None:
+        One probe at a time here, not the idle budget: this runs between messages
+        of a live copy, and the pacing delay between probes would otherwise sit
+        squarely in the job's critical path.
+        """
+        await self._check_channels(max_probes=1)
+
+    async def _check_channels(
+        self, force: bool = False, max_probes: int | None = None
+    ) -> None:
         """Record this account's access to every channel it hasn't probed yet."""
         from app.worker import worker_main
 
-        if self._manager.consume_resolve_trigger():
-            force = True
+        # Give up rather than queue: a caller that finds a check already running
+        # has nothing to add, and waiting its turn would only stack up another
+        # round of probes behind the one in flight.
+        if self._channel_check_lock.locked():
+            return
+
         now = asyncio.get_running_loop().time()
+        # Checked before `force`: a refresh asked for from the UI is still no
+        # reason to probe inside a window Telegram has explicitly closed.
+        if now < self._channel_flood_until:
+            return
+
+        if self._manager.consume_resolve_trigger(self):
+            force = True
         if not force and now - self._last_channel_check < _CHANNEL_CHECK_EVERY_S:
             return
         self._last_channel_check = now
-        try:
-            await worker_main.check_channels_for_account(self.client, self.userbot.id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning("Userbot %s: channel access check failed: %s", self.label, e)
+        async with self._channel_check_lock:
+            try:
+                cooldown = await worker_main.check_channels_for_account(
+                    self.client, self.userbot.id, max_probes=max_probes
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("Userbot %s: channel access check failed: %s", self.label, e)
+                return
+
+        if cooldown:
+            # Note the window and move on. Sleeping it off here would park the
+            # whole runner — and, from the copy engine's callback, the job it is
+            # in the middle of — for what can be hours.
+            self._channel_flood_until = asyncio.get_running_loop().time() + cooldown
+            logger.warning(
+                "Userbot %s: channel probing paused for %ds after a FloodWait "
+                "(jobs are unaffected)", self.label, cooldown,
+            )
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -260,9 +306,11 @@ class UserbotRunner:
                     if handled:
                         continue
 
-                # Idle: cheap enough to run every poll, so a channel added or
-                # refreshed from the UI is re-checked by every account at once.
-                await self._check_channels(force=True)
+                # Idle, but not free: forcing this every poll meant a probe burst
+                # every few seconds on every account at once. The floor applies
+                # here too; a refresh asked for from the UI still jumps the queue
+                # through consume_resolve_trigger() inside.
+                await self._check_channels()
                 await self._sleep(poll_interval)
 
             except asyncio.CancelledError:
@@ -473,14 +521,23 @@ class UserbotRunner:
         buf_min = state_repo.get_int_setting("flood_buffer_min_s", 5)
         buf_max = state_repo.get_int_setting("flood_buffer_max_s", 10)
         buffer_s = random.uniform(buf_min, buf_max)  # nosec B311 — timing jitter, not crypto
-        total_wait = wait_s + buffer_s
-        retry_at = (datetime.utcnow() + timedelta(seconds=total_wait)).strftime("%Y-%m-%d %H:%M:%S")
 
         new_count = job_repo.increment_retry(job.id)
         max_retries = state_repo.get_int_setting("max_retries", 5)
+
+        # Telegram's own number is a floor, not the answer. A job that keeps
+        # coming back with a one-second FloodWait was retrying every ~9 seconds
+        # and getting nowhere; the same escalating backoff _handle_job_error uses
+        # turns that into a real pause after the second failure.
+        backoff_s = min(60 * (2 ** (new_count - 1)), 600)
+        total_wait = max(wait_s + buffer_s, backoff_s)
+        retry_at = (datetime.utcnow() + timedelta(seconds=total_wait)).strftime("%Y-%m-%d %H:%M:%S")
+
         logger.warning(
-            "Userbot %s job #%d: FloodWait %ds (buffer=%.1fs) — retry #%d/%d after %s",
-            self.label, job.id, wait_s, buffer_s, new_count, max_retries, retry_at,
+            "Userbot %s job #%d: FloodWait %ds (buffer=%.1fs, backoff=%ds) — "
+            "retry #%d/%d after %s (in %.0fs)",
+            self.label, job.id, wait_s, buffer_s, backoff_s,
+            new_count, max_retries, retry_at, total_wait,
         )
 
         if new_count >= max_retries:
@@ -929,6 +986,9 @@ class UserbotManager:
         self._tasks: dict[int, asyncio.Task] = {}
         self._busy: dict[int, int] = {}  # userbot_id → job_id
         self._resolve_trigger: asyncio.Event | None = None
+        # Bumped every time the bot asks for a refresh; each runner remembers the
+        # last one it acted on. See consume_resolve_trigger.
+        self._resolve_seq = 0
 
     def set_resolve_trigger(self, event: asyncio.Event) -> None:
         self._resolve_trigger = event
@@ -953,17 +1013,26 @@ class UserbotManager:
 
     # ── Primary-only duties (delegated back to worker_main) ───────────────────
 
-    def consume_resolve_trigger(self) -> bool:
+    def consume_resolve_trigger(self, runner: "UserbotRunner") -> bool:
         """
-        True once after the bot asks for an immediate channel check.
+        True once *per runner* after the bot asks for an immediate channel check.
 
-        Only an accelerator: the checks are driven by the DB, so a runner that
-        misses the trigger still picks the work up on its next cycle.
+        Access is a per-account fact, so every account has to re-probe. Clearing
+        a shared Event handed the refresh to whichever runner happened to look
+        first and left the others waiting out the normal interval, which is the
+        opposite of what "refresh now" means. A generation counter gives each
+        runner the news exactly once.
+
+        Still only an accelerator: the checks are driven by the DB, so a runner
+        that misses a bump picks the work up on its next cycle regardless.
         """
         if self._resolve_trigger is not None and self._resolve_trigger.is_set():
             self._resolve_trigger.clear()
-            return True
-        return False
+            self._resolve_seq += 1
+        if runner._resolve_seen == self._resolve_seq:  # pylint: disable=protected-access
+            return False
+        runner._resolve_seen = self._resolve_seq  # pylint: disable=protected-access
+        return True
 
     async def run_primary_duties(self, client: TelegramClient) -> bool:
         """Scans and bulk deletes. True if real work happened."""

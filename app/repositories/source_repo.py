@@ -87,16 +87,31 @@ def update_source_extra_info(
     photos_count: Optional[int],
     videos_count: Optional[int],
     docs_count: Optional[int],
+    forwards_restricted: Optional[bool] = None,
 ) -> None:
     conn = db.get_connection()
     conn.execute(
+        # COALESCE, not a plain assignment: `None` here means "this metadata pass
+        # could not tell", and must leave a previously proven answer standing.
         """UPDATE sources SET
             username=?, participants_count=?, about=?, verified=?,
-            channel_type=?, total_messages=?, photos_count=?, videos_count=?, docs_count=?
+            channel_type=?, total_messages=?, photos_count=?, videos_count=?, docs_count=?,
+            forwards_restricted=COALESCE(?, forwards_restricted)
            WHERE id=?""",
         (username, participants_count, about, int(verified),
          channel_type, total_messages, photos_count, videos_count, docs_count,
+         None if forwards_restricted is None else int(forwards_restricted),
          source_id),
+    )
+    conn.commit()
+
+
+def set_source_forwards_restricted(source_id: int, restricted: bool) -> None:
+    """Record whether the source channel blocks forwarding (protected content)."""
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE sources SET forwards_restricted = ? WHERE id = ?",
+        (int(restricted), source_id),
     )
     conn.commit()
 
@@ -198,16 +213,31 @@ def update_destination_extra_info(
     photos_count: Optional[int],
     videos_count: Optional[int],
     docs_count: Optional[int],
+    forwards_restricted: Optional[bool] = None,
 ) -> None:
     conn = db.get_connection()
     conn.execute(
+        # COALESCE, not a plain assignment: `None` here means "this metadata pass
+        # could not tell", and must leave a previously proven answer standing.
         """UPDATE destinations SET
             username=?, participants_count=?, about=?, verified=?,
-            channel_type=?, total_messages=?, photos_count=?, videos_count=?, docs_count=?
+            channel_type=?, total_messages=?, photos_count=?, videos_count=?, docs_count=?,
+            forwards_restricted=COALESCE(?, forwards_restricted)
            WHERE id=?""",
         (username, participants_count, about, int(verified),
          channel_type, total_messages, photos_count, videos_count, docs_count,
+         None if forwards_restricted is None else int(forwards_restricted),
          dest_id),
+    )
+    conn.commit()
+
+
+def set_destination_forwards_restricted(dest_id: int, restricted: bool) -> None:
+    """Record whether the destination channel blocks forwarding (protected content)."""
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE destinations SET forwards_restricted = ? WHERE id = ?",
+        (int(restricted), dest_id),
     )
     conn.commit()
 

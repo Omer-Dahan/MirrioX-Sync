@@ -13,8 +13,10 @@ import asyncio
 import logging
 import signal
 from datetime import datetime, timedelta
+from typing import Optional
 
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 
 from app.config import Config
 from app.network_errors import is_network_error
@@ -26,6 +28,11 @@ logger = logging.getLogger(__name__)
 
 _shutdown_event: asyncio.Event | None = None
 _resolve_trigger: asyncio.Event | None = None
+
+# How many channel probes one pass may spend. A probe is the most FloodWait-prone
+# thing the worker does, so a list of twenty new channels is drained over several
+# cycles rather than fired off in one burst.
+_CHANNEL_PROBE_PER_CYCLE = 5
 
 # One ScanEngine per client instance (only the primary runner ever uses these).
 _scan_engines: dict[int, ScanEngine] = {}
@@ -63,6 +70,12 @@ async def _async_run(config: Config) -> None:
     # Single-account installs keep working untouched: the .env session is
     # registered as the default account the first time the worker starts.
     userbot_repo.ensure_default(config.TELETHON_SESSION)
+
+    # Staged downloads are cleaned up in a `finally`, which survives a failed
+    # send but not a killed process. Nothing can be in flight this early, so
+    # anything still there is debris from a previous run.
+    from app.worker.copy_engine import cleanup_temp_media
+    cleanup_temp_media()
 
     _startup_recovery()
 
@@ -258,8 +271,15 @@ def _startup_recovery() -> None:
 
 
 
-async def _notify(chat_id_str: str | None, text: str, job_id: int, label: str) -> None:
-    """Send a notification via the management bot. Shared helper for all worker notifications."""
+async def _notify(chat_id_str: str | None, text: str, ref_id: int, label: str) -> None:
+    """
+    Send a notification via the management bot. Shared helper for all worker notifications.
+
+    `ref_id` is whatever the notification is about — usually a job, but not
+    always. The log line says so rather than calling every id a job: printing
+    "Job #12" for a *source* #12 sent anyone grepping the log for that job
+    chasing an event that had nothing to do with it.
+    """
     if not chat_id_str:
         return
     try:
@@ -268,7 +288,7 @@ async def _notify(chat_id_str: str | None, text: str, job_id: int, label: str) -
         return
     from app.bot.bot_main import send_notification
     await send_notification(chat_id, text)
-    logger.info("Job #%d: %s notification sent", job_id, label)
+    logger.info("Notification sent [%s] for #%d", label, ref_id)
 
 
 async def send_network_disruption_notification(
@@ -645,7 +665,9 @@ async def send_daily_limit_notification(
     await _notify(state_repo.get_setting("main_chat_id"), text, job_id, "daily_limit")
 
 
-async def check_channels_for_account(client: TelegramClient, userbot_id: int) -> None:
+async def check_channels_for_account(
+    client: TelegramClient, userbot_id: int, max_probes: Optional[int] = None
+) -> int:
     """
     Probe every source/destination this account hasn't checked yet and record
     whether it can reach them, so the UI can report access per account.
@@ -654,14 +676,40 @@ async def check_channels_for_account(client: TelegramClient, userbot_id: int) ->
     another is not. Every active account therefore runs this for itself, and the
     first one that gets through also fills in the channel's title, ID and extra
     info — a channel is resolvable as long as *some* account can see it.
+
+    Paced on purpose. A probe is up to six API calls, most of them the resolve
+    family with the longest FloodWaits Telegram hands out, and this used to run
+    with no gap at all across every account at once from a single IP. A long
+    pending list now drains over several cycles instead of in one burst.
+    `max_probes` is the API budget for this pass — the caller lowers it while the
+    account is busy copying, so the pacing never stalls a running job.
+
+    Returns the number of seconds the caller should hold off before probing
+    again: 0 normally, the FloodWait's own figure when Telegram asked us to wait.
+    **Never sleeps that figure off itself** — this runs on the runner's poll loop
+    and on the copy engine's per-message callback, so sleeping out a
+    resolve-family FloodWait (routinely hundreds of seconds, sometimes hours)
+    would take the whole account, and any job it was mid-way through, down with it.
     """
     from app.repositories import channel_access_repo, source_repo
 
     pending = channel_access_repo.get_unchecked_channels(userbot_id)
     if not pending:
-        return
+        return 0
+
+    delay_s = state_repo.get_int_setting("channel_check_delay_ms", 3000) / 1000.0
+    budget = max(1, max_probes or _CHANNEL_PROBE_PER_CYCLE)
+    spent = 0        # API budget spent, metadata passes included
+    done = 0         # channels actually answered for
 
     for kind, channel_id, channel_ref in pending:
+        if spent >= budget:
+            logger.info(
+                "Userbot #%d: %d channel(s) still unchecked — continuing next cycle",
+                userbot_id, len(pending) - done,
+            )
+            return 0
+
         is_source = kind == channel_access_repo.KIND_SOURCE
         channel = (
             source_repo.get_source_by_id(channel_id)
@@ -671,11 +719,25 @@ async def check_channels_for_account(client: TelegramClient, userbot_id: int) ->
         if channel is None:
             continue  # deleted while we were working through the list
 
+        if spent:
+            await asyncio.sleep(delay_s)
+        spent += 1
+
         try:
             entity = await get_entity_safe(client, channel_ref)
             # get_entity alone resolves public channels without membership; read one
             # message so the probe reflects what a job would actually be able to do.
             await client.get_messages(entity, limit=1)
+        except FloodWaitError as e:
+            # Not an access answer. Recording it as "no access" wrote a row that
+            # get_unchecked_channels then filtered out, so the channel was never
+            # probed again and looked permanently unreachable in the UI.
+            logger.warning(
+                "Userbot #%d: FloodWait %ds while probing %s '%s' — stopping this "
+                "cycle, the channel stays unchecked",
+                userbot_id, e.seconds, kind, channel_ref,
+            )
+            return e.seconds
         except Exception as e:
             channel_access_repo.record(kind, channel_id, userbot_id, False, str(e)[:300])
             logger.info(
@@ -683,15 +745,29 @@ async def check_channels_for_account(client: TelegramClient, userbot_id: int) ->
                 userbot_id, kind, channel.name, channel_ref, e,
             )
             _mark_unreachable_if_nobody_has_access(kind, channel_id, str(e))
+            done += 1
             continue
 
         channel_access_repo.record(kind, channel_id, userbot_id, True, None)
+        done += 1
         logger.info(
             "Userbot #%d has access to %s '%s'", userbot_id, kind, channel.name
         )
 
         if channel.resolved_id is None:
-            await _resolve_channel_info(client, kind, channel_id, entity, channel_ref)
+            # Four more metadata calls — counted against the same budget.
+            spent += 1
+            try:
+                await _resolve_channel_info(client, kind, channel_id, entity, channel_ref)
+            except FloodWaitError as e:
+                logger.warning(
+                    "Userbot #%d: FloodWait %ds while reading metadata for %s '%s' — "
+                    "access is recorded, the details will be filled in later",
+                    userbot_id, e.seconds, kind, channel_ref,
+                )
+                return e.seconds
+
+    return 0
 
 
 async def _resolve_channel_info(
@@ -716,13 +792,25 @@ async def _resolve_channel_info(
     # Metadata is a bonus — the channel is already resolved and reachable without it.
     try:
         extra = await _fetch_channel_extra_info(client, entity)
+    except FloodWaitError:
+        # The one failure that is not a bonus: it means we are being throttled,
+        # and the caller has to stop probing rather than carry on to the next
+        # channel and make it worse.
+        raise
     except Exception as e:
         logger.warning("Could not fetch extra info for %s '%s': %s", kind, channel_ref, e)
         return
+
+    was_restricted = _is_forwards_restricted(kind, channel_id)
     if is_source:
         source_repo.update_source_extra_info(channel_id, **extra)
     else:
         source_repo.update_destination_extra_info(channel_id, **extra)
+
+    # Telling the admin now, before a job is ever started on this channel, is the
+    # whole point: it changes how the copy will behave.
+    if is_source and extra.get("forwards_restricted") and not was_restricted:
+        await send_forwards_restricted_notification(channel_id)
 
 
 def _mark_unreachable_if_nobody_has_access(kind: str, channel_id: int, error: str) -> None:
@@ -751,10 +839,19 @@ async def _fetch_channel_extra_info(client: TelegramClient, entity) -> dict:
         InputMessagesFilterDocument,
     )
 
+    from telethon.tl.types import Channel
+
     username = getattr(entity, "username", None)
     participants_count = getattr(entity, "participants_count", None)
     about = getattr(entity, "about", None)
     verified = bool(getattr(entity, "verified", False))
+    # Free: the resolved Channel object already carries the flag, so knowing
+    # whether the channel blocks forwarding costs no extra call. Only a real
+    # Channel is authoritative, though — for anything else (a basic group, a
+    # user) None is passed through and the stored answer is left alone, so
+    # weaker metadata can never erase what a refused forward actually proved.
+    forwards_restricted = bool(getattr(entity, "noforwards", False)) \
+        if isinstance(entity, Channel) else None
 
     if getattr(entity, "broadcast", False):
         channel_type = "ערוץ"
@@ -765,27 +862,23 @@ async def _fetch_channel_extra_info(client: TelegramClient, entity) -> dict:
     else:
         channel_type = "קבוצה"
 
-    total_messages = photos_count = videos_count = docs_count = None
-    try:
-        msgs = await client.get_messages(entity, limit=1)
-        total_messages = msgs.total
-    except Exception:  # nosec B110 — optional metadata, failure is non-fatal
-        pass
-    try:
-        msgs = await client.get_messages(entity, limit=1, filter=InputMessagesFilterPhotos)
-        photos_count = msgs.total
-    except Exception:  # nosec B110 — optional metadata, failure is non-fatal
-        pass
-    try:
-        msgs = await client.get_messages(entity, limit=1, filter=InputMessagesFilterVideo)
-        videos_count = msgs.total
-    except Exception:  # nosec B110 — optional metadata, failure is non-fatal
-        pass
-    try:
-        msgs = await client.get_messages(entity, limit=1, filter=InputMessagesFilterDocument)
-        docs_count = msgs.total
-    except Exception:  # nosec B110 — optional metadata, failure is non-fatal
-        pass
+    # Every count is optional, so a failure is swallowed — with one exception.
+    # A FloodWaitError swallowed here is exactly what makes the *next* call
+    # flood too: these four run back to back on every newly resolved channel,
+    # so the throttling above only works if this one error is allowed out.
+    async def _count(**kwargs) -> Optional[int]:
+        try:
+            msgs = await client.get_messages(entity, limit=1, **kwargs)
+            return msgs.total
+        except FloodWaitError:
+            raise
+        except Exception:  # nosec B110 — optional metadata, failure is non-fatal
+            return None
+
+    total_messages = await _count()
+    photos_count = await _count(filter=InputMessagesFilterPhotos)
+    videos_count = await _count(filter=InputMessagesFilterVideo)
+    docs_count = await _count(filter=InputMessagesFilterDocument)
 
     return {
         "username": username,
@@ -797,4 +890,99 @@ async def _fetch_channel_extra_info(client: TelegramClient, entity) -> dict:
         "photos_count": photos_count,
         "videos_count": videos_count,
         "docs_count": docs_count,
+        "forwards_restricted": forwards_restricted,
     }
+
+
+def _is_forwards_restricted(kind: str, channel_id: int) -> bool:
+    """Current stored answer for one channel. Unknown counts as 'not restricted'."""
+    from app.repositories import channel_access_repo, source_repo
+
+    channel = (
+        source_repo.get_source_by_id(channel_id)
+        if kind == channel_access_repo.KIND_SOURCE
+        else source_repo.get_destination_by_id(channel_id)
+    )
+    return bool(channel and channel.forwards_restricted)
+
+
+async def note_forwards_restricted(source_id: int) -> None:
+    """
+    Record that a source blocks forwarding, alerting the admin the first time.
+
+    Called from the copy engine, which is the authoritative witness: it learns
+    this from Telegram refusing an actual forward, so it catches a channel whose
+    metadata was never fetched as well as one that changed the setting later.
+    The transition itself is the guard — no separate "already told them" column.
+    """
+    from app.repositories import source_repo
+
+    src = source_repo.get_source_by_id(source_id)
+    if src is None or src.forwards_restricted:
+        return
+    source_repo.set_source_forwards_restricted(source_id, True)
+    await send_forwards_restricted_notification(source_id)
+
+
+async def send_forwards_restricted_notification(source_id: int) -> None:
+    """Tell the admin a source channel blocks forwarding, and what that means."""
+    from app.repositories import source_repo
+    from app.ui.texts import esc, toggle_is_on
+
+    src = source_repo.get_source_by_id(source_id)
+    if src is None:
+        return
+
+    if toggle_is_on(state_repo.get_settings_dict(), "allow_download_upload"):
+        fallback_line = (
+            "⬇️ מסלול החירום (הורדה והעלאה) פעיל — הודעה שלא תעבור בדרך המהירה "
+            "תועתק לאט, בהורדה מלאה."
+        )
+    else:
+        fallback_line = (
+            "⬇️ מסלול החירום (הורדה והעלאה) כבוי — הודעה שלא תעבור בדרך המהירה "
+            "תסומן ככישלון במקום להאט את המשימה לשעות. ניתן להפעיל אותו בהגדרות."
+        )
+
+    text = (
+        f"🔒 <b>ערוץ מוגן — חוסם העברה</b>\n\n"
+        f"📡 מקור: <b>{esc(src.display())}</b>\n\n"
+        f"הערוץ מסומן ב-Telegram כתוכן מוגן, כך שהעברה רגילה ממנו נחסמת.\n"
+        f"⚡ ההעתקה תמשיך בדרך המהירה (שליחה לפי הפניית הקובץ) — ללא הורדה "
+        f"והעלאה, ולכן ללא האטה משמעותית.\n"
+        f"{fallback_line}"
+    )
+
+    await _notify(state_repo.get_setting("main_chat_id"), text, source_id, "forwards_restricted")
+
+
+async def send_copy_blocked_notification(job_id: int, source_id: int, error: str) -> None:
+    """
+    The job cannot copy at all: the fast path was refused and downloading is off.
+
+    Separate from the discovery notification on purpose. That one only fires on
+    the transition to "protected", so a source already on record produces no
+    alert at all — and a job would then fail message after message in silence,
+    which is the exact outcome the switch was added to prevent.
+    """
+    from app.repositories import source_repo
+    from app.ui.texts import esc
+
+    job = job_repo.get_by_id(job_id)
+    src = source_repo.get_source_by_id(source_id)
+    job_name = esc(job.name) if job else f"#{job_id}"
+    src_name = esc(src.display()) if src else f"#{source_id}"
+
+    text = (
+        f"⛔ <b>ההעתקה נחסמה</b>\n\n"
+        f"📋 משימה: <b>{job_name}</b>\n"
+        f"📡 מקור: {src_name}\n\n"
+        f"הערוץ חוסם העברה, וגם השליחה המהירה (לפי הפניית הקובץ) נדחתה:\n"
+        f"<code>{esc(error)}</code>\n\n"
+        f"ההודעות נרשמות ככישלון והמשימה ממשיכה הלאה — היא לא נתקעת.\n"
+        f"כדי להעתיק אותן בכל זאת: הפעל בהגדרות את "
+        f"<b>אפשר הורדה והעלאה כמסלול חירום</b> והרץ את המשימה מחדש. "
+        f"<i>שים לב שזה איטי משמעותית.</i>"
+    )
+
+    await _notify(state_repo.get_setting("main_chat_id"), text, job_id, "copy_blocked")

@@ -91,7 +91,10 @@ class RateLimiter:
         batch_size_max: int = 100,
         batch_pause_min_s: int = 60,
         batch_pause_max_s: int = 120,
-        dest_min_delay_ms: int = 1000,
+        # Matches the seeded default in db._run_migrations. This gate is shared by
+        # every account writing to the same destination, so it is what actually
+        # bounds what one channel receives per hour.
+        dest_min_delay_ms: int = 2500,
         label: str | None = None,
     ):
         self._log = LabeledAdapter(logger, {"label": label}) if label else logger

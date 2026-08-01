@@ -16,8 +16,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import random
-from dataclasses import dataclass
+import shutil
+import tempfile
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional, Callable, Awaitable
 from zoneinfo import ZoneInfo
@@ -69,6 +73,36 @@ _FLOOD_INLINE_MAX_ATTEMPTS = 3
 # counter exists to catch a job that cannot make progress; a job that has just
 # copied this many in a row plainly can.
 _RETRY_RESET_AFTER_COPIES = 200
+# Where the emergency download+re-upload path stages files. Only reached when the
+# operator turns `allow_download_upload` on and a by-reference send was refused.
+_TEMP_MEDIA_DIR = os.path.join(tempfile.gettempdir(), "mirriox_media")
+# How long a cached read of app_settings is good for on the per-message paths
+# (hyper backup). Bulk jobs re-read once per job and never use this.
+_SETTINGS_CACHE_TTL_S = 10.0
+
+
+@dataclass
+class _SourceProtection:
+    """
+    What this run has learned about the source channel's forward restriction.
+
+    Shared by reference, not copied: `_flood_retry` re-invokes the send it wraps,
+    and passing a plain bool meant every inner attempt started over from a
+    ForwardMessagesRequest Telegram had already refused once — a wasted call, and
+    a wasted download+re-upload behind it, for every attempt of every message.
+    """
+    # True once Telegram refuses to forward out of the source, or once the source
+    # row already says the channel blocks forwarding.
+    is_protected: bool = False
+    # None until the first protected message of the run answers it: does sending
+    # by file_reference alone work on this pair of channels? Learned once so no
+    # message pays for a doomed attempt, and never un-learned after a success —
+    # one odd message must not push the whole job onto the slow path.
+    ref_send_works: Optional[bool] = None
+    # True once this run has told the admin that it cannot copy at all (the fast
+    # path was refused and the download fallback is off). Without it a job of ten
+    # thousand messages would send ten thousand identical alerts.
+    blocked_reported: bool = False
 
 
 @dataclass
@@ -81,9 +115,7 @@ class _JobContext:
     dst_targets: list
     blocked_words: list[str]
     skip_duplicates: bool
-    # Learned the first time a forward is refused, then honoured for the rest of
-    # the run so we don't retry a forward that can only fail.
-    src_is_protected: bool = False
+    protection: _SourceProtection = field(default_factory=_SourceProtection)
 
 
 class _Progress:
@@ -134,8 +166,37 @@ class CopyEngine:
         self._resolve_callback = resolve_callback
         self._userbot_id = userbot_id
         self._log = LabeledAdapter(logger, {"label": label}) if label else logger
-        # Refreshed from settings on every job; see _prepare.
+        # Refreshed from settings on every job; see _load_copy_settings.
         self._flood_inline_max_s = 60
+        # Off unless the operator turns it on: a protected source is copied by
+        # file reference, and download+re-upload is the rare emergency route.
+        self._allow_download_upload = False
+        self._max_download_mb = 2048
+        self._settings_loaded_at = 0.0
+
+    def _load_copy_settings(self, settings: dict[str, str]) -> None:
+        """Refresh the per-run knobs every entry point needs. Called once per job."""
+        from app.ui.texts import toggle_is_on
+
+        self._rate_limiter.update_from_settings(settings)
+        self._flood_inline_max_s = _int_setting(settings, "flood_inline_max_s", 60)
+        self._allow_download_upload = toggle_is_on(settings, "allow_download_upload")
+        self._max_download_mb = _int_setting(settings, "max_download_mb", 2048)
+        self._settings_loaded_at = time.monotonic()
+
+    def _load_copy_settings_cached(self) -> None:
+        """
+        Same refresh, but at most once every `_SETTINGS_CACHE_TTL_S`.
+
+        For the paths that run per message rather than per job (hyper backup):
+        re-reading app_settings on every single message put three sqlite queries
+        on the shared event loop for each one, and none of these knobs changes
+        often enough to be worth that.
+        """
+        if time.monotonic() - self._settings_loaded_at < _SETTINGS_CACHE_TTL_S:
+            return
+        from app.repositories import state_repo
+        self._load_copy_settings(state_repo.get_settings_dict())
 
     # ── FloodWait handling ─────────────────────────────────────────────────────
 
@@ -346,8 +407,7 @@ class CopyEngine:
         from app.repositories import state_repo
 
         settings = state_repo.get_settings_dict()
-        self._rate_limiter.update_from_settings(settings)
-        self._flood_inline_max_s = state_repo.get_int_setting("flood_inline_max_s", 60)
+        self._load_copy_settings(settings)
 
         blocked_words: list[str] = []
         if job.use_blocked_words:
@@ -410,6 +470,12 @@ class CopyEngine:
             dst_targets=dst_targets,
             blocked_words=blocked_words,
             skip_duplicates=settings.get("skip_duplicates", "0") == "1",
+            # Known-protected sources start the run already knowing it, so a job
+            # that restarts does not re-learn it at the cost of another refused
+            # forward — the very call that counts against the flood quota.
+            protection=_SourceProtection(
+                is_protected=bool(getattr(src_rec, "forwards_restricted", None))
+            ),
         )
 
     async def _finalize(self, job: Job, ctx: _JobContext) -> bool:
@@ -536,10 +602,10 @@ class CopyEngine:
 
             dest_id, dst_entity = random.choice(ctx.dst_targets)  # nosec B311
             try:
-                status, skip_reason, ctx.src_is_protected = await self._flood_retry(
+                status, skip_reason = await self._flood_retry(
                     lambda: self._process_message(
                         job, msg, ctx.blocked_words, ctx.src_entity, dst_entity,
-                        ctx.src_is_protected, skip_duplicates=ctx.skip_duplicates,
+                        ctx.protection, skip_duplicates=ctx.skip_duplicates,
                     ),
                     f"Job #{job.id}: retry of msg #{msg_id}",
                 )
@@ -660,7 +726,7 @@ class CopyEngine:
             allowed_types: set[str] = set((job.content_types or DEFAULT_CONTENT_TYPES).split(","))
             to_send: list[Message] = []
             for m in buffer:
-                if not job.copy_text and (not m.media or isinstance(m.media, MessageMediaUnsupported)):
+                if not job.copy_text and not _has_transferable_file(m):
                     job_repo.record_copied_message(job.id, m.id, None, "skipped", "text_stripped_empty", userbot_id=self._userbot_id)
                     already_done.add(m.id)
                     p.skipped += 1
@@ -693,31 +759,24 @@ class CopyEngine:
             dest_id, dst_entity = random.choice(dst_targets)  # nosec B311
 
             async def _send_single(m: Message) -> tuple[str, str | None]:
-                """Forward one message; returns (status, reason). Updates ctx.src_is_protected."""
+                """Forward one message; returns (status, reason). Updates ctx.protection."""
+                if ctx.protection.is_protected:
+                    return await self._copy_protected(job, m, dst_entity, ctx.protection)
                 try:
-                    if ctx.src_is_protected:
-                        await self._send_as_copy(m, dst_entity, copy_text=job.copy_text)
+                    if job.copy_text:
+                        await self._client(ForwardMessagesRequest(
+                            from_peer=src_entity,
+                            id=[m.id],
+                            to_peer=dst_entity,
+                            drop_author=True,
+                            random_id=[random.randint(0, 2**63 - 1)],  # nosec B311
+                        ))
                     else:
-                        if job.copy_text:
-                            await self._client(ForwardMessagesRequest(
-                                from_peer=src_entity,
-                                id=[m.id],
-                                to_peer=dst_entity,
-                                drop_author=True,
-                                random_id=[random.randint(0, 2**63 - 1)],  # nosec B311
-                            ))
-                        else:
-                            await self._client.send_file(dst_entity, m.media, caption="")
+                        await self._client.send_file(dst_entity, m.media, caption="")
                     return "copied", None
                 except ChatForwardsRestrictedError:
-                    ctx.src_is_protected = True
-                    try:
-                        await self._send_as_copy(m, dst_entity, copy_text=job.copy_text)
-                        return "copied", None
-                    except FloodWaitError:
-                        raise
-                    except Exception as e:
-                        return "failed", str(e)[:200]
+                    await self._note_protected(job, ctx.protection)
+                    return await self._copy_protected(job, m, dst_entity, ctx.protection)
                 except FloodWaitError:
                     raise
                 except Exception as e:
@@ -837,10 +896,10 @@ class CopyEngine:
 
             # An existing album is forwarded whole to one random destination.
             dest_id, dst_entity = random.choice(dst_targets)  # nosec B311
-            statuses, ctx.src_is_protected = await self._flood_retry(
+            statuses = await self._flood_retry(
                 lambda: self._process_group(
                     job, pending, blocked_words, src_entity, dst_entity,
-                    ctx.src_is_protected, skip_duplicates=skip_duplicates,
+                    ctx.protection, skip_duplicates=skip_duplicates,
                 ),
                 f"Job #{job.id}: album of {len(pending)}",
             )
@@ -920,10 +979,10 @@ class CopyEngine:
                             continue
 
                         dest_id, dst_entity = random.choice(dst_targets)  # nosec B311
-                        status, skip_reason, ctx.src_is_protected = await self._flood_retry(
+                        status, skip_reason = await self._flood_retry(
                             lambda: self._process_message(
                                 job, msg, blocked_words, src_entity, dst_entity,
-                                ctx.src_is_protected, skip_duplicates=skip_duplicates,
+                                ctx.protection, skip_duplicates=skip_duplicates,
                             ),
                             f"Job #{job.id}: msg #{msg.id}",
                         )
@@ -1116,18 +1175,18 @@ class CopyEngine:
         blocked_words: list[str],
         src_entity,
         dst_entity,
-        src_is_protected: bool,
+        protection: _SourceProtection,
         skip_duplicates: bool = False,
-    ) -> tuple[list[tuple[str, Optional[str]]], bool]:
+    ) -> list[tuple[str, Optional[str]]]:
         """
-        Forward a media-group (album) as a single batch.
-        Returns (statuses, src_is_protected) — one status per message.
-        src_is_protected is updated to True if the channel turns out to be protected.
+        Forward a media-group (album) as a single batch. Returns one status per message.
+
+        `protection` is updated in place if the channel turns out to be protected.
         """
         # Global block word checks
         if blocked_words and any(self._is_blocked(m, blocked_words) for m in group):
             self._log.debug("Job #%d: group %d blocked by filter", job.id, group[0].grouped_id)
-            return [("skipped", "blocked_word")] * len(group), src_is_protected
+            return [("skipped", "blocked_word")] * len(group)
 
         allowed_types: set[str] = set((job.content_types or DEFAULT_CONTENT_TYPES).split(","))
 
@@ -1136,7 +1195,7 @@ class CopyEngine:
 
         # Filter items individually
         for m in group:
-            if not job.copy_text and (not m.media or isinstance(m.media, MessageMediaUnsupported)):
+            if not job.copy_text and not _has_transferable_file(m):
                 final_statuses.append(("skipped", "text_stripped_empty"))
                 continue
             
@@ -1155,27 +1214,38 @@ class CopyEngine:
 
         if not send_group:
             self._log.debug("Job #%d: album group=%s all items skipped", job.id, group[0].grouped_id)
-            return [st for st in final_statuses if st is not None], src_is_protected
+            return [st for st in final_statuses if st is not None]
 
         def fill_statuses(st_tuple):
             return [st_tuple if st is None else st for st in final_statuses]
 
-        if len(send_group) == 1:
-            st, reason, src_is_protected = await self._process_message(
-                job, send_group[0], [], src_entity, dst_entity, src_is_protected
-            )
-            return fill_statuses((st, reason)), src_is_protected
+        def fill_each(results: list[tuple[str, Optional[str]]]):
+            """Slot per-item results into the placeholders, in order."""
+            it = iter(results)
+            return [next(it) if st is None else st for st in final_statuses]
 
-        if src_is_protected:
-            # Channel already known to be protected — skip straight to download+upload
+        if len(send_group) == 1:
+            st, reason = await self._process_message(
+                job, send_group[0], [], src_entity, dst_entity, protection
+            )
+            return fill_statuses((st, reason))
+
+        if protection.is_protected:
+            # Known protected: no point spending a forward that can only be
+            # refused. _send_group_as_copy carries the album over by file
+            # reference and only downloads if that is refused and allowed.
             try:
-                await self._send_group_as_copy(send_group, dst_entity, copy_text=job.copy_text)
-                return fill_statuses(("copied", None)), src_is_protected
+                await self._send_group_as_copy(
+                    send_group, dst_entity, copy_text=job.copy_text,
+                    allow_download=self._allow_download_upload,
+                )
+                return fill_statuses(("copied", None))
             except FloodWaitError:
                 raise
             except Exception as e:
-                self._log.warning("Job #%d: download+upload album failed: %s", job.id, e)
-                return fill_statuses(("failed", str(e)[:200])), src_is_protected
+                return fill_each(await self._copy_group_individually(
+                    job, send_group, dst_entity, protection, e
+                ))
 
         ids = [m.id for m in send_group]
         try:
@@ -1196,22 +1266,22 @@ class CopyEngine:
                 "Job #%d: forwarded album of %d items (ids=%s)",
                 job.id, len(ids), ids,
             )
-            return fill_statuses(("copied", None)), src_is_protected
+            return fill_statuses(("copied", None))
 
         except ChatForwardsRestrictedError:
-            src_is_protected = True
-            self._log.info(
-                "Job #%d: source channel is protected — switching to download+upload for all remaining messages",
-                job.id,
-            )
+            await self._note_protected(job, protection)
             try:
-                await self._send_group_as_copy(send_group, dst_entity, copy_text=job.copy_text)
-                return fill_statuses(("copied", None)), src_is_protected
+                await self._send_group_as_copy(
+                    send_group, dst_entity, copy_text=job.copy_text,
+                    allow_download=self._allow_download_upload,
+                )
+                return fill_statuses(("copied", None))
             except FloodWaitError:
                 raise
             except Exception as e:
-                self._log.warning("Job #%d: download+upload album failed: %s", job.id, e)
-                return fill_statuses(("failed", str(e)[:200])), src_is_protected
+                return fill_each(await self._copy_group_individually(
+                    job, send_group, dst_entity, protection, e
+                ))
 
         except FloodWaitError:
             raise
@@ -1221,7 +1291,7 @@ class CopyEngine:
                 "Job #%d: failed to forward album (ids=%s): %s",
                 job.id, ids, e,
             )
-            return fill_statuses(("failed", str(e)[:200])), src_is_protected
+            return fill_statuses(("failed", str(e)[:200]))
 
     async def _process_message(
         self,
@@ -1230,20 +1300,25 @@ class CopyEngine:
         blocked_words: list[str],
         src_entity,
         dst_entity,
-        src_is_protected: bool,
+        protection: _SourceProtection,
         skip_duplicates: bool = False,
-    ) -> tuple[str, Optional[str], bool]:
-        """Copy one message. Returns (status, skip_reason, src_is_protected)."""
+    ) -> tuple[str, Optional[str]]:
+        """
+        Copy one message. Returns (status, skip_reason).
+
+        `protection` is updated in place the moment a forward is refused, so a
+        re-attempt of this same message never repeats the refused call.
+        """
 
         # Filter check
         if blocked_words and self._is_blocked(msg, blocked_words):
             self._log.debug("Job #%d: msg #%d blocked by filter", job.id, msg.id)
-            return "skipped", "blocked_word", src_is_protected
+            return "skipped", "blocked_word"
 
         # Already sent this exact content to any of the job's destinations
         if skip_duplicates and dedup_repo.is_duplicate_any(msg, job.destination_id_list()):
             self._log.debug("Job #%d: msg #%d skipped as duplicate", job.id, msg.id)
-            return "skipped", "duplicate", src_is_protected
+            return "skipped", "duplicate"
 
         # Content type filter
         allowed_types: set[str] = set((job.content_types or DEFAULT_CONTENT_TYPES).split(","))
@@ -1251,30 +1326,30 @@ class CopyEngine:
             msg_type = self._get_content_type(msg)
             if msg_type not in allowed_types:
                 self._log.debug("Job #%d: msg #%d skipped (type=%s not in %s)", job.id, msg.id, msg_type, allowed_types)
-                return "skipped", f"content_type:{msg_type}", src_is_protected
+                return "skipped", f"content_type:{msg_type}"
 
         # Supported type check
         if not self._is_supported_type(msg):
             self._log.debug("Job #%d: msg #%d unsupported type", job.id, msg.id)
-            return "skipped", "unsupported_type", src_is_protected
+            return "skipped", "unsupported_type"
 
         # Skip empty service messages
         if not msg.text and not msg.media:
-            return "skipped", "empty_message", src_is_protected
+            return "skipped", "empty_message"
 
-        if not job.copy_text and (not msg.media or isinstance(msg.media, MessageMediaUnsupported)):
-            return "skipped", "text_stripped_empty", src_is_protected
+        # `media` is not the same as "has a file to send": a link preview, a
+        # contact or a venue all set .media and carry nothing sendable. Testing
+        # the file, not the media, is what keeps such a message from being
+        # recorded as copied when every send path quietly did nothing.
+        if not job.copy_text and not _has_transferable_file(msg):
+            return "skipped", "text_stripped_empty"
+        if job.copy_text and not msg.text and not _has_transferable_file(msg):
+            return "skipped", "empty_message"
 
-        if src_is_protected:
-            # Channel already known to be protected — skip straight to download+upload
-            try:
-                await self._send_as_copy(msg, dst_entity, copy_text=job.copy_text)
-                return "copied", None, src_is_protected
-            except FloodWaitError:
-                raise
-            except Exception as e:
-                self._log.warning("Job #%d: failed to copy msg #%d: %s", job.id, msg.id, e)
-                return "failed", str(e)[:200], src_is_protected
+        if protection.is_protected:
+            # Known protected: sending the forward anyway would only spend an API
+            # call on a refusal, and that call counts against the flood quota.
+            return await self._copy_protected(job, msg, dst_entity, protection)
 
         try:
             if job.copy_text:
@@ -1287,29 +1362,159 @@ class CopyEngine:
                 ))
             else:
                 await self._client.send_file(dst_entity, msg.media, caption="")
-            return "copied", None, src_is_protected
+            return "copied", None
 
         except ChatForwardsRestrictedError:
-            src_is_protected = True
-            self._log.info(
-                "Job #%d: source channel is protected — switching to download+upload for all remaining messages",
-                job.id,
-            )
-            try:
-                await self._send_as_copy(msg, dst_entity, copy_text=job.copy_text)
-                return "copied", None, src_is_protected
-            except FloodWaitError:
-                raise
-            except Exception as e:
-                self._log.warning("Job #%d: failed to copy msg #%d: %s", job.id, msg.id, e)
-                return "failed", str(e)[:200], src_is_protected
+            await self._note_protected(job, protection)
+            return await self._copy_protected(job, msg, dst_entity, protection)
 
         except FloodWaitError:
             raise
 
         except Exception as e:
             self._log.warning("Job #%d: failed to copy msg #%d: %s", job.id, msg.id, e)
-            return "failed", str(e)[:200], src_is_protected
+            return "failed", str(e)[:200]
+
+    async def _note_protected(self, job: Job, protection: _SourceProtection) -> None:
+        """
+        Telegram just refused to forward out of this source. Remember it.
+
+        Written to the source row as well as to this run's state, so the next job
+        on the same channel starts out knowing it and never spends the refused
+        forward again. The first time a channel turns out to be protected the
+        admin is told, since it changes what the copy can and cannot do.
+        """
+        if protection.is_protected:
+            return
+        protection.is_protected = True
+        self._log.info(
+            "Job #%d: source channel blocks forwarding — copying by file reference from here on",
+            job.id,
+        )
+        try:
+            from app.worker import worker_main
+            await worker_main.note_forwards_restricted(job.source_id)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            # Bookkeeping and notification must never take a copy down with them.
+            self._log.debug("Job #%d: could not record forwards_restricted: %s", job.id, e)
+
+    async def _copy_group_individually(
+        self,
+        job: Job,
+        group: list[Message],
+        dst_entity,
+        protection: _SourceProtection,
+        album_error: Exception,
+    ) -> list[tuple[str, Optional[str]]]:
+        """
+        Send a protected album one message at a time. One status per message.
+
+        The album API is far narrower than a plain send: `SendMultiMediaRequest`
+        takes photos and ordinary videos only, so a group holding a GIF, a plain
+        document or a round note cannot go as an album at all. That used to mean
+        the whole group failed once the download fallback was switched off — even
+        though `send_file(dst, msg.media)` carries every one of those types by
+        reference perfectly well. The items simply arrive unglued rather than as
+        an album, which is the right trade against losing them.
+
+        Per-message statuses, not one for the batch: a partial send here is real,
+        and recording the whole group as copied would lose whatever did not go.
+        """
+        self._log.warning(
+            "Job #%d: album of %d could not be sent as a group (%s) — sending "
+            "the items individually by reference",
+            job.id, len(group), album_error,
+        )
+        results: list[tuple[str, Optional[str]]] = []
+        for m in group:
+            results.append(await self._flood_retry(
+                lambda msg=m: self._copy_protected(job, msg, dst_entity, protection),
+                f"Job #{job.id}: album item #{m.id}",
+            ))
+        return results
+
+    async def _report_copy_blocked(
+        self, job: Job, protection: _SourceProtection, error: Exception
+    ) -> None:
+        """Alert once per run that this job cannot copy at all. Never raises."""
+        if protection.blocked_reported:
+            return
+        protection.blocked_reported = True
+        self._log.error(
+            "Job #%d: the fast path was refused and download+upload is off — "
+            "messages will be recorded as failed until it is turned on",
+            job.id,
+        )
+        try:
+            from app.worker import worker_main
+            await worker_main.send_copy_blocked_notification(
+                job.id, job.source_id, str(error)[:200]
+            )
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            self._log.debug("Job #%d: could not send copy-blocked alert: %s", job.id, e)
+
+    async def _copy_protected(
+        self, job: Job, msg: Message, dst_entity, protection: _SourceProtection
+    ) -> tuple[str, Optional[str]]:
+        """
+        Copy one message out of a channel that blocks forwarding.
+
+        By file reference first, always: `send_file(dst, msg.media)` hands
+        Telegram the copy it already has, so nothing is downloaded and nothing is
+        uploaded no matter how large the file is. Download+re-upload stays as an
+        emergency route only, and only when the operator has switched it on —
+        otherwise a job that hits it would crawl for hours unnoticed.
+        """
+        # Neither route sends anything for a message with no file and no text —
+        # a bare contact, venue or dice. Saying "copied" for one of those would
+        # record a message, spend a dedup entry and pay a rate-limiter delay for
+        # a send that never happened.
+        text = msg.text if job.copy_text else ""
+        if not _has_transferable_file(msg) and not text:
+            return "skipped", "empty_message"
+
+        # Once a by-ref send has worked on this pair of channels the method is
+        # proven; a later failure is that one message's problem, not the route's.
+        # With the download route off there is nothing to fall back to, so keep
+        # trying by ref regardless of what the last message did.
+        if protection.ref_send_works is not False or not self._allow_download_upload:
+            try:
+                await self._send_by_ref(msg, dst_entity, copy_text=job.copy_text)
+                protection.ref_send_works = True
+                return "copied", None
+            except FloodWaitError:
+                raise
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                if protection.ref_send_works is None:
+                    protection.ref_send_works = False
+                self._log.warning(
+                    "Job #%d: by-reference send failed for msg #%d: %s", job.id, msg.id, e
+                )
+                if not self._allow_download_upload:
+                    # Fail loudly rather than quietly falling into hours of
+                    # downloading. "Loudly" has to mean an alert of its own: a
+                    # source already on record as protected produces no
+                    # transition, so the discovery notification never fires and
+                    # the whole job would fail message by message in silence.
+                    await self._report_copy_blocked(job, protection, e)
+                    return "failed", "forwards_restricted"
+
+        size_mb = _media_size_mb(msg)
+        if size_mb is not None and size_mb > self._max_download_mb:
+            self._log.warning(
+                "Job #%d: msg #%d is %.0fMB, over the %dMB download ceiling — skipped",
+                job.id, msg.id, size_mb, self._max_download_mb,
+            )
+            return "skipped", "file_too_large"
+
+        try:
+            await self._send_as_copy(msg, dst_entity, copy_text=job.copy_text)
+            return "copied", None
+        except FloodWaitError:
+            raise
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            self._log.warning("Job #%d: failed to copy msg #%d: %s", job.id, msg.id, e)
+            return "failed", str(e)[:200]
 
     def _record_transfer(self, job: Job, msg: Message, destination_id: int) -> None:
         """Add a successfully transferred message to the global dedup registry."""
@@ -1334,8 +1539,7 @@ class CopyEngine:
         from app.repositories import state_repo
 
         settings = state_repo.get_settings_dict()
-        self._rate_limiter.update_from_settings(settings)
-        self._flood_inline_max_s = state_repo.get_int_setting("flood_inline_max_s", 60)
+        self._load_copy_settings(settings)
         skip_duplicates = settings.get("skip_duplicates", "0") == "1"
 
         if msg is None or not hasattr(msg, "id"):
@@ -1367,9 +1571,15 @@ class CopyEngine:
 
         dest_id, dst_entity = random.choice(dst_targets)  # nosec B311
 
-        status, skip_reason, _ = await self._flood_retry(
+        # One message, one call: the protection state lives only for this send,
+        # but it starts from what the source row already knows so a live copy out
+        # of a protected channel skips the refused forward too.
+        protection = _SourceProtection(
+            is_protected=bool(getattr(src_rec, "forwards_restricted", None))
+        )
+        status, skip_reason = await self._flood_retry(
             lambda: self._process_message(
-                job, msg, blocked_words, src_entity, dst_entity, False,
+                job, msg, blocked_words, src_entity, dst_entity, protection,
                 skip_duplicates=skip_duplicates,
             ),
             f"Job #{job.id} (continuous): live msg #{msg.id}",
@@ -1457,6 +1667,11 @@ class CopyEngine:
         if is_capped is not None and is_capped():
             return "queued"
 
+        # Read only once there is something to send: hyper runs off a live event
+        # handler, and this backup may be the only work this account ever does.
+        # Cached, because this runs per message rather than per job.
+        self._load_copy_settings_cached()
+
         try:
             dst_entity = await get_entity_safe(
                 self._client, str(dst_rec.resolved_id or dst_rec.channel_ref)
@@ -1473,16 +1688,29 @@ class CopyEngine:
                 f"Hyper: msg #{msg.id}",
             )
         except ChatForwardsRestrictedError:
+            # Same rule as a job: hand Telegram the file reference it already has
+            # rather than moving the bytes twice.
             try:
                 await self._flood_retry(
-                    lambda: self._send_as_copy(msg, dst_entity, copy_text=True),
-                    f"Hyper: msg #{msg.id} (copy)",
+                    lambda: self._send_by_ref(msg, dst_entity, copy_text=True),
+                    f"Hyper: msg #{msg.id} (by ref)",
                 )
             except FloodWaitError:
                 raise
-            except Exception as e:  # noqa: BLE001
-                self._log.warning("Hyper: download+upload fallback failed for #%s: %s", msg.id, e)
-                return "failed"
+            except Exception as ref_err:  # noqa: BLE001
+                self._log.warning("Hyper: by-reference send failed for #%s: %s", msg.id, ref_err)
+                if not self._allow_download_upload:
+                    return "failed"
+                try:
+                    await self._flood_retry(
+                        lambda: self._send_as_copy(msg, dst_entity, copy_text=True),
+                        f"Hyper: msg #{msg.id} (copy)",
+                    )
+                except FloodWaitError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    self._log.warning("Hyper: download+upload fallback failed for #%s: %s", msg.id, e)
+                    return "failed"
         except FloodWaitError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -1513,25 +1741,59 @@ class CopyEngine:
             random_id=[random.randint(0, 2**63 - 1)],  # nosec B311
         ))
 
-    async def _send_as_copy(self, msg: Message, dst_entity, copy_text: bool = True) -> None:
-        """Download and re-upload a single message (used when forwarding is blocked).
-        Raises RuntimeError if media download returns None (caller records as failed)."""
+    async def _send_by_ref(self, msg: Message, dst_entity, copy_text: bool = True) -> None:
+        """
+        Send a single message using the file reference Telegram already holds.
+
+        This is the fast path out of a channel that blocks forwarding: handing
+        `msg.media` to send_file makes Telethon build an InputMediaDocument /
+        InputMediaPhoto from the existing file_reference, so not one byte of the
+        file travels in either direction — a 2GB video costs the same as a photo.
+        Nothing is replayed by hand: the document carries its own filename, audio
+        title and video attributes with it.
+
+        The one thing a forward does that this cannot is carry an unlimited
+        caption; a fresh send is subject to Telegram's 1024-character limit, so a
+        longer text is truncated.
+        """
         text = msg.text if copy_text else ""
 
-        if not msg.media or isinstance(msg.media, MessageMediaUnsupported):
+        if not _has_transferable_file(msg):
             if text:
                 await self._client.send_message(dst_entity, text)
             return
 
-        file_bytes: Optional[bytes] = await self._client.download_media(msg, file=bytes)
-        if file_bytes is None:
+        await self._client.send_file(
+            dst_entity,
+            msg.media,
+            caption=_truncate_caption(text) or None,
+        )
+
+    async def _send_as_copy(self, msg: Message, dst_entity, copy_text: bool = True) -> None:
+        """Download and re-upload a single message — the emergency route only.
+
+        Reached when a by-reference send was refused *and* the operator has turned
+        `allow_download_upload` on. Raises RuntimeError if the media cannot be
+        downloaded (caller records the message as failed)."""
+        text = msg.text if copy_text else ""
+
+        if not _has_transferable_file(msg):
+            if text:
+                await self._client.send_message(dst_entity, text)
+            return
+
+        # To disk, not to memory: `file=bytes` held the whole file in the
+        # process's RAM, so one 2GB video both spiked memory and blocked the
+        # shared event loop while it was assembled.
+        path = await self._download_to_temp(msg)
+        if path is None:
             # Media could not be downloaded (e.g. forwarded from protected channel)
             raise RuntimeError("download_failed: media returned None (protected or unavailable)")
 
-        # Raw bytes carry no filename, so Telethon would upload a PDF as "unnamed"
-        # and strip an audio track's title. Replaying the source attributes fixes
-        # that, and force_document keeps a document a document instead of letting
-        # Telethon sniff an image file back into a photo.
+        # A re-upload from disk keeps the filename, but an audio track's title and
+        # a document's other attributes still have to be replayed, and
+        # force_document keeps a document a document instead of letting Telethon
+        # sniff an image file back into a photo.
         # Documents only: photos have no attributes to replay, and Telegram
         # rejects a sticker's attributes on a fresh upload.
         attributes = None
@@ -1542,16 +1804,47 @@ class CopyEngine:
                 attributes = list(doc.attributes)
                 force_document = True
 
-        # A protected source has to be re-uploaded, and a fresh upload is subject
-        # to the caption limit — unlike a forward, which carries the original text
-        # over however long it is.
-        await self._client.send_file(
-            dst_entity,
-            file_bytes,
-            caption=_truncate_caption(text) or None,
-            attributes=attributes,
-            force_document=force_document,
-        )
+        try:
+            # A protected source has to be re-uploaded, and a fresh upload is
+            # subject to the caption limit — unlike a forward, which carries the
+            # original text over however long it is.
+            #
+            # Retried here rather than only by the caller's _flood_retry: that one
+            # wraps the whole message, so a FloodWait on the upload threw away a
+            # download that had just finished and did the whole transfer again.
+            await self._flood_retry(
+                lambda: self._client.send_file(
+                    dst_entity,
+                    path,
+                    caption=_truncate_caption(text) or None,
+                    attributes=attributes,
+                    force_document=force_document,
+                ),
+                f"upload of msg #{msg.id}",
+            )
+        finally:
+            _discard_temp(path)
+
+    async def _download_to_temp(self, msg: Message) -> Optional[str]:
+        """
+        Download one message's media into a staging directory of its own.
+
+        A private directory per download, not a shared one: Telethon names the
+        file after the source document, and its "does this name exist yet" check
+        is a plain stat. Two accounts on this one event loop downloading files
+        with the same name both saw "free", picked the same path, and one
+        overwrote the other's media — then deleted it out from under the upload.
+        """
+        os.makedirs(_TEMP_MEDIA_DIR, exist_ok=True)
+        staging = tempfile.mkdtemp(dir=_TEMP_MEDIA_DIR)
+        try:
+            path = await self._client.download_media(msg, file=staging)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        if path is None:
+            shutil.rmtree(staging, ignore_errors=True)
+        return path
 
     async def _send_group_by_ref(self, group: list[Message], dst_entity, copy_text: bool = True) -> None:
         """
@@ -1624,10 +1917,22 @@ class CopyEngine:
 
         await self._client(SendMultiMediaRequest(peer=dst_entity, multi_media=multi))
 
-    async def _send_group_as_copy(self, group: list[Message], dst_entity, copy_text: bool = True) -> None:
+    async def _send_group_as_copy(
+        self,
+        group: list[Message],
+        dst_entity,
+        copy_text: bool = True,
+        allow_download: bool = True,
+    ) -> None:
         """
-        Send a media group by trying file references first (fast), then
-        falling back to download+reupload (slow, used when refs are expired).
+        Send a media group by file reference (fast), falling back to
+        download+reupload when the album API cannot carry the items by reference.
+
+        `allow_download` is what a protected source passes: there the fallback is
+        the operator's `allow_download_upload` switch, and with it off the group
+        fails loudly instead of quietly costing hours. An unprotected source
+        leaves it on — the fallback there is about item types the album API
+        rejects (plain docs, GIFs, round notes), not about protection.
         """
         try:
             await self._send_group_by_ref(group, dst_entity, copy_text=copy_text)
@@ -1635,36 +1940,49 @@ class CopyEngine:
         except FloodWaitError:
             raise
         except Exception as e:
+            if not allow_download:
+                raise RuntimeError(f"album_ref_send_failed: {e}") from e
             self._log.warning("Job: send_group_by_ref failed (%s) — falling back to download+upload", e)
 
-        # Fallback: download and re-upload
-        files: list[bytes] = []
+        # Fallback: download to disk and re-upload. Files, not bytes — an album of
+        # ten videos held in memory at once is what the loop stalls were made of.
+        paths: list[str] = []
         captions: list[str] = []
         failed_downloads: list[Message] = []
-        for m in group:
-            if m.media and not isinstance(m.media, MessageMediaUnsupported):
-                data: Optional[bytes] = await self._client.download_media(m, file=bytes)
-                if data:
-                    files.append(data)
-                    captions.append(_truncate_caption(m.text) if copy_text else "")
-                else:
-                    failed_downloads.append(m)
-            # text-only messages in a group are included via caption, no separate download needed
+        try:
+            for m in group:
+                if m.media and not isinstance(m.media, MessageMediaUnsupported):
+                    size_mb = _media_size_mb(m)
+                    if size_mb is not None and size_mb > self._max_download_mb:
+                        raise RuntimeError(
+                            f"file_too_large: msg #{m.id} is {size_mb:.0f}MB, "
+                            f"over the {self._max_download_mb}MB ceiling"
+                        )
+                    path = await self._download_to_temp(m)
+                    if path:
+                        paths.append(path)
+                        captions.append(_truncate_caption(m.text) if copy_text else "")
+                    else:
+                        failed_downloads.append(m)
+                # text-only messages in a group are included via caption, no separate download needed
 
-        if failed_downloads:
-            # Raise so callers can record these as failed instead of silently dropping
-            ids = [m.id for m in failed_downloads]
-            raise RuntimeError(
-                f"download_failed: {len(failed_downloads)} media item(s) returned None (ids={ids})"
-            )
+            if failed_downloads:
+                # Raise so callers can record these as failed instead of silently dropping
+                ids = [m.id for m in failed_downloads]
+                raise RuntimeError(
+                    f"download_failed: {len(failed_downloads)} media item(s) returned None (ids={ids})"
+                )
 
-        if not files:
-            text = next((m.text for m in group if m.text), None) if copy_text else None
-            if text:
-                await self._client.send_message(dst_entity, text)
-            return
+            if not paths:
+                text = next((m.text for m in group if m.text), None) if copy_text else None
+                if text:
+                    await self._client.send_message(dst_entity, text)
+                return
 
-        await self._client.send_file(dst_entity, files, caption=captions)
+            await self._client.send_file(dst_entity, paths, caption=captions)
+        finally:
+            for path in paths:
+                _discard_temp(path)
 
     def _is_blocked(self, msg: Message, blocked_words: list[str]) -> bool:
         text = (msg.text or "").lower()
@@ -1748,6 +2066,91 @@ class CopyEngine:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _has_transferable_file(msg: Message) -> bool:
+    """
+    True if the message carries a photo or document that can be sent on.
+
+    Not every `media` is a file: a link preview (MessageMediaWebPage), a contact
+    or a venue has nothing to send, and handing one to send_file only produces a
+    TypeError. Those messages are text, and are sent as text.
+    """
+    media = getattr(msg, "media", None)
+    if not media or isinstance(media, MessageMediaUnsupported):
+        return False
+    return bool(getattr(media, "photo", None) or getattr(media, "document", None))
+
+
+def _media_size_mb(msg: Message) -> Optional[float]:
+    """
+    A message's media size in MB, or None if Telegram didn't state one.
+
+    Free: the size travels with the message we already have, so a file too big to
+    be worth downloading is recognised before a single byte moves.
+    """
+    size = getattr(getattr(msg, "file", None), "size", None)
+    if size is None:
+        doc = getattr(getattr(msg, "media", None), "document", None)
+        size = getattr(doc, "size", None)
+    if not size:
+        return None
+    return size / (1024 * 1024)
+
+
+def _int_setting(settings: dict[str, str], key: str, default: int) -> int:
+    """Read one int out of an already-fetched settings dict, without another query."""
+    try:
+        return int(settings[key])
+    except (KeyError, ValueError, TypeError):
+        return default
+
+
+def _discard_temp(path: Optional[str]) -> None:
+    """
+    Delete a staged download and the private directory it lives in.
+
+    Never raises: by the time this runs the send has already happened, and a
+    file left behind must not turn a successful copy into a failure.
+    """
+    if not path:
+        return
+    staging = os.path.dirname(os.path.abspath(path))
+    # Only ever inside our own staging root — never follow a path out of it.
+    if os.path.dirname(staging) == os.path.abspath(_TEMP_MEDIA_DIR):
+        shutil.rmtree(staging, ignore_errors=True)
+        return
+    try:
+        os.remove(path)
+    except OSError as e:
+        logger.debug("Could not remove temp file %s: %s", path, e)
+
+
+def cleanup_temp_media() -> int:
+    """
+    Drop whatever the emergency download path left behind. Returns dirs removed.
+
+    The per-send cleanup runs in a `finally`, which covers a failed send but not
+    a killed process — so a crash mid-download used to leave gigabytes parked in
+    the temp directory forever. Called once at worker startup, when no download
+    can be in flight.
+    """
+    if not os.path.isdir(_TEMP_MEDIA_DIR):
+        return 0
+    removed = 0
+    for name in os.listdir(_TEMP_MEDIA_DIR):
+        target = os.path.join(_TEMP_MEDIA_DIR, name)
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                os.remove(target)
+            removed += 1
+        except OSError as e:
+            logger.debug("Could not remove stale temp entry %s: %s", target, e)
+    if removed:
+        logger.info("Cleared %d stale staged download(s) from %s", removed, _TEMP_MEDIA_DIR)
+    return removed
+
 
 def _utf16_len(text: str) -> int:
     """

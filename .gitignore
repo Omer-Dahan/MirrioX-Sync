@@ -43,3 +43,4 @@ sessions/
 
 # Claude Code project settings
 .claude/
+tests/test_protected_copy.py

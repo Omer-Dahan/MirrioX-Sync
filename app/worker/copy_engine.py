@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import mimetypes
 import os
 import random
 import shutil
@@ -41,6 +42,7 @@ from telethon.tl.types import (
 
 from app.models import ALL_CONTENT_TYPES, DEFAULT_CONTENT_TYPES, Job, JobChunk, NoAccessError
 from app.repositories import job_repo, job_chunk_repo, filter_repo, source_repo, dedup_repo
+from app.worker import fast_transfer
 from app.worker.rate_limiter import LabeledAdapter, RateLimiter
 
 logger = logging.getLogger(__name__)
@@ -172,6 +174,7 @@ class CopyEngine:
         # file reference, and download+re-upload is the rare emergency route.
         self._allow_download_upload = False
         self._max_download_mb = 2048
+        self._parallel_connections = 8
         self._settings_loaded_at = 0.0
 
     def _load_copy_settings(self, settings: dict[str, str]) -> None:
@@ -182,6 +185,10 @@ class CopyEngine:
         self._flood_inline_max_s = _int_setting(settings, "flood_inline_max_s", 60)
         self._allow_download_upload = toggle_is_on(settings, "allow_download_upload")
         self._max_download_mb = _int_setting(settings, "max_download_mb", 2048)
+        # 1 disables the parallel path entirely and falls back to plain Telethon.
+        self._parallel_connections = max(
+            1, min(20, _int_setting(settings, "parallel_connections", 8))
+        )
         self._settings_loaded_at = time.monotonic()
 
     def _load_copy_settings_cached(self) -> None:
@@ -1459,11 +1466,19 @@ class CopyEngine:
         """
         Copy one message out of a channel that blocks forwarding.
 
-        By file reference first, always: `send_file(dst, msg.media)` hands
-        Telegram the copy it already has, so nothing is downloaded and nothing is
-        uploaded no matter how large the file is. Download+re-upload stays as an
-        emergency route only, and only when the operator has switched it on —
-        otherwise a job that hits it would crawl for hours unnoticed.
+        **There is no zero-byte route out of a protected channel.** Telegram ties
+        a file_reference to the chat it came from and rejects it anywhere else:
+        `messages.sendMedia` documents CHAT_FORWARDS_RESTRICTED as "You can't
+        forward messages from a protected chat", and that is what it returns for
+        `send_file(dst, msg.media)` just as it does for a plain forward. Every
+        public "save restricted content" bot downloads and re-uploads for exactly
+        this reason. What makes those bots quick is not a trick to avoid the
+        transfer, it is running the transfer over many connections at once — see
+        `fast_transfer`, which is what this path uses.
+
+        A by-reference send is still tried first, once, but only until the
+        channel answers: a `ChatForwardsRestrictedError` is a fact about the
+        channel, not about the message, so it is latched and never re-attempted.
         """
         # Neither route sends anything for a message with no file and no text —
         # a bare contact, venue or dice. Saying "copied" for one of those would
@@ -1473,20 +1488,30 @@ class CopyEngine:
         if not _has_transferable_file(msg) and not text:
             return "skipped", "empty_message"
 
-        # Once a by-ref send has worked on this pair of channels the method is
-        # proven; a later failure is that one message's problem, not the route's.
-        # With the download route off there is nothing to fall back to, so keep
-        # trying by ref regardless of what the last message did.
-        if protection.ref_send_works is not False or not self._allow_download_upload:
+        if protection.ref_send_works is not False:
             try:
                 await self._send_by_ref(msg, dst_entity, copy_text=job.copy_text)
                 protection.ref_send_works = True
                 return "copied", None
             except FloodWaitError:
                 raise
+            except ChatForwardsRestrictedError as e:
+                # Definitive, and true for every message in the channel. Retrying
+                # it per message cost one refused API call each — seventy of them
+                # in ninety seconds, in the log that led to this.
+                protection.ref_send_works = False
+                self._log.info(
+                    "Job #%d: the channel also refuses by-reference sends — "
+                    "every message must be transferred in full",
+                    job.id,
+                )
+                if not self._allow_download_upload:
+                    await self._report_copy_blocked(job, protection, e)
+                    return "failed", "forwards_restricted"
             except Exception as e:  # pylint: disable=broad-exception-caught
-                if protection.ref_send_works is None:
-                    protection.ref_send_works = False
+                # Anything else is this one message's problem until proven
+                # otherwise, so the route is *not* written off — one odd item
+                # must not decide that the rest of the channel is unreachable.
                 self._log.warning(
                     "Job #%d: by-reference send failed for msg #%d: %s", job.id, msg.id, e
                 )
@@ -1498,6 +1523,11 @@ class CopyEngine:
                     # the whole job would fail message by message in silence.
                     await self._report_copy_blocked(job, protection, e)
                     return "failed", "forwards_restricted"
+        elif not self._allow_download_upload:
+            # Already proven impossible and there is nothing to fall back to.
+            # Spending an API call per message to be told so again is the loop
+            # this branch exists to prevent.
+            return "failed", "forwards_restricted"
 
         size_mb = _media_size_mb(msg)
         if size_mb is not None and size_mb > self._max_download_mb:
@@ -1770,11 +1800,10 @@ class CopyEngine:
         )
 
     async def _send_as_copy(self, msg: Message, dst_entity, copy_text: bool = True) -> None:
-        """Download and re-upload a single message — the emergency route only.
+        """Download and re-upload a single message — the only route out of a protected source.
 
-        Reached when a by-reference send was refused *and* the operator has turned
-        `allow_download_upload` on. Raises RuntimeError if the media cannot be
-        downloaded (caller records the message as failed)."""
+        Raises RuntimeError if the media cannot be downloaded (caller records the
+        message as failed)."""
         text = msg.text if copy_text else ""
 
         if not _has_transferable_file(msg):
@@ -1805,6 +1834,7 @@ class CopyEngine:
                 force_document = True
 
         try:
+            handle, attributes = await self._upload_from_temp(msg, path, attributes)
             # A protected source has to be re-uploaded, and a fresh upload is
             # subject to the caption limit — unlike a forward, which carries the
             # original text over however long it is.
@@ -1815,7 +1845,7 @@ class CopyEngine:
             await self._flood_retry(
                 lambda: self._client.send_file(
                     dst_entity,
-                    path,
+                    handle,
                     caption=_truncate_caption(text) or None,
                     attributes=attributes,
                     force_document=force_document,
@@ -1824,6 +1854,14 @@ class CopyEngine:
             )
         finally:
             _discard_temp(path)
+
+    def _fast_transfer_ready(self, msg: Message) -> bool:
+        """True if this message's media can go over the parallel path on this build."""
+        if self._parallel_connections < 2:
+            return False
+        return fast_transfer.is_available(self._client) and fast_transfer.can_transfer(
+            msg.media, self._parallel_connections
+        )
 
     async def _download_to_temp(self, msg: Message) -> Optional[str]:
         """
@@ -1834,17 +1872,93 @@ class CopyEngine:
         is a plain stat. Two accounts on this one event loop downloading files
         with the same name both saw "free", picked the same path, and one
         overwrote the other's media — then deleted it out from under the upload.
+
+        Several connections at once where that is possible: Telethon's own
+        download runs over a single one, which is what made a protected channel
+        take hours rather than minutes. Any failure in that path falls back to
+        the ordinary download — it leans on Telethon internals, so it has to be
+        allowed to stop working without taking the copy with it.
         """
         os.makedirs(_TEMP_MEDIA_DIR, exist_ok=True)
         staging = tempfile.mkdtemp(dir=_TEMP_MEDIA_DIR)
+        path: Optional[str] = None
         try:
-            path = await self._client.download_media(msg, file=staging)
-        except BaseException:
-            shutil.rmtree(staging, ignore_errors=True)
+            if self._fast_transfer_ready(msg):
+                doc = msg.media.document
+                candidate = os.path.join(staging, _document_filename(doc, msg.id))
+                try:
+                    async with fast_transfer.transfer_lock(self._client):
+                        await fast_transfer.download_document(
+                            self._client, doc, candidate, self._parallel_connections
+                        )
+                    path = candidate
+                except FloodWaitError:
+                    raise
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    self._log.warning(
+                        "Parallel download failed for msg #%s (%s) — falling back "
+                        "to the single-connection path", msg.id, e,
+                    )
+                    _remove_file(candidate)
+            if path is None:
+                path = await self._client.download_media(msg, file=staging)
+            return path
+        finally:
+            # One cleanup, in one place. The previous shape deleted the staging
+            # directory in an `except` and then had a `finally` call os.listdir on
+            # it — which raised FileNotFoundError and *replaced* the real error, so
+            # every FloodWait surfaced as "[Errno 2] No such file or directory" and
+            # the fallback below it never ran. `ignore_errors` keeps this from ever
+            # masking an exception on the way out again.
+            if path is None:
+                shutil.rmtree(staging, ignore_errors=True)
+
+    async def _upload_from_temp(self, msg: Message, path: str, attributes):
+        """
+        Upload a staged file, in parallel where possible.
+
+        Returns `(handle, attributes)` for send_file. The parallel path hands
+        back a raw InputFile, which carries no metadata of its own — so the
+        source document's attributes have to travel with it or a video arrives
+        as a nameless document. On the ordinary path the file on disk still
+        describes itself, and the caller's own attribute replay is left exactly
+        as it was.
+
+        The mime type rides along in the filename, deliberately: `send_file`
+        takes a `mime_type` keyword only in the sense that `**kwargs` swallows
+        it — it is never forwarded to `_file_to_media`, so passing it would look
+        correct and do nothing. `_document_filename` guarantees a sensible
+        extension, which is what Telethon actually reads.
+        """
+        if not self._fast_transfer_ready(msg):
+            return path, attributes
+
+        doc = msg.media.document
+        try:
+            async with fast_transfer.transfer_lock(self._client):
+                handle = await self._flood_retry(
+                    lambda: fast_transfer.upload_document(
+                        self._client, path, self._parallel_connections
+                    ),
+                    f"parallel upload of msg #{msg.id}",
+                )
+        except FloodWaitError:
             raise
-        if path is None:
-            shutil.rmtree(staging, ignore_errors=True)
-        return path
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            self._log.warning(
+                "Parallel upload failed for msg #%s (%s) — falling back to the "
+                "single-connection path", msg.id, e,
+            )
+            return path, attributes
+
+        # Telegram rejects a sticker's attributes on a fresh upload; everything
+        # else (filename, video dimensions, audio title, streaming support) has
+        # to be replayed or it is lost.
+        replay = [
+            a for a in doc.attributes
+            if a.__class__.__name__ != "DocumentAttributeSticker"
+        ]
+        return handle, replay or attributes
 
     async def _send_group_by_ref(self, group: list[Message], dst_entity, copy_text: bool = True) -> None:
         """
@@ -2103,6 +2217,37 @@ def _int_setting(settings: dict[str, str], key: str, default: int) -> int:
         return int(settings[key])
     except (KeyError, ValueError, TypeError):
         return default
+
+
+def _document_filename(doc, msg_id: int) -> str:
+    """
+    The document's own filename, or a safe stand-in built from the message id.
+
+    The parallel path writes to a path we choose, so unlike `download_media` it
+    has no name handed to it. Sanitised because the source controls this string
+    and it is about to become a path.
+    """
+    name = None
+    for attr in getattr(doc, "attributes", ()):
+        name = getattr(attr, "file_name", None)
+        if name:
+            break
+    name = os.path.basename(name or "")
+    safe = "".join(c for c in name if c.isalnum() or c in "._- ").strip()
+    if safe in ("", ".", ".."):
+        ext = mimetypes.guess_extension(getattr(doc, "mime_type", "") or "") or ".bin"
+        return f"msg_{msg_id}{ext}"
+    return safe
+
+
+def _remove_file(path: Optional[str]) -> None:
+    """Delete one file, ignoring the case where it was never created."""
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:  # nosec B110 — best-effort cleanup of a failed transfer
+        pass
 
 
 def _discard_temp(path: Optional[str]) -> None:

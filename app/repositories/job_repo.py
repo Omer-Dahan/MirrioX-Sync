@@ -885,44 +885,52 @@ def get_transfer_stats() -> dict:
     cutoff_24h      = (now_utc - timedelta(hours=24)).strftime(fmt)
 
     conn = db.get_connection()
-    row = conn.execute(
-        """SELECT
-             COUNT(CASE WHEN processed_at >= ? THEN 1 END) AS last_hour,
-             COUNT(CASE WHEN processed_at >= ? THEN 1 END) AS since_midnight,
-             COUNT(CASE WHEN processed_at >= ? THEN 1 END) AS last_24h,
-             COUNT(*)                                      AS all_time,
-             MIN(processed_at)                             AS first_at
-           FROM copied_messages
-           WHERE status = 'copied'""",
-        (cutoff_hour, cutoff_midnight, cutoff_24h),
-    ).fetchone()
 
     # Grouped on copied_messages.userbot_id — the account is stamped on the row at
     # transfer time. Deriving it from jobs.assigned_userbot_id would lose every
     # completed job, because the assignment is cleared the moment a job ends.
+    # Grouping by userbot_id computes both per-account and overall totals in a single
+    # index-assisted scan on idx_copied_status_ub_proc.
     rows = conn.execute(
         """SELECT
              cm.userbot_id,
              COUNT(CASE WHEN cm.processed_at >= ? THEN 1 END) AS last_hour,
              COUNT(CASE WHEN cm.processed_at >= ? THEN 1 END) AS since_midnight,
              COUNT(CASE WHEN cm.processed_at >= ? THEN 1 END) AS last_24h,
-             COUNT(*)                                         AS all_time
+             COUNT(*)                                         AS all_time,
+             MIN(cm.processed_at)                             AS first_at
            FROM copied_messages cm
            WHERE cm.status = 'copied'
            GROUP BY cm.userbot_id""",
         (cutoff_hour, cutoff_midnight, cutoff_24h),
     ).fetchall()
 
-    # Key 0 collects rows copied before per-account attribution existed.
     userbots_stats = {}
+    copied_totals = {"last_hour": 0, "since_midnight": 0, "last_24h": 0, "all_time": 0}
+    copied_first_at = None
+
+    # Key 0 collects rows copied before per-account attribution existed.
     for r in rows:
         uid = r["userbot_id"] or 0
+        lh = r["last_hour"] or 0
+        sm = r["since_midnight"] or 0
+        l24 = r["last_24h"] or 0
+        at = r["all_time"] or 0
+        fat = r["first_at"]
+
         userbots_stats[uid] = {
-            "last_hour": r["last_hour"] or 0,
-            "since_midnight": r["since_midnight"] or 0,
-            "last_24h": r["last_24h"] or 0,
-            "all_time": r["all_time"] or 0,
+            "last_hour": lh,
+            "since_midnight": sm,
+            "last_24h": l24,
+            "all_time": at,
         }
+        copied_totals["last_hour"] += lh
+        copied_totals["since_midnight"] += sm
+        copied_totals["last_24h"] += l24
+        copied_totals["all_time"] += at
+
+        if fat and (copied_first_at is None or fat < copied_first_at):
+            copied_first_at = fat
 
     # Hyper transfers consume the same account quota (see
     # get_daily_count_for_userbot) — add them so the displayed numbers match
@@ -953,19 +961,12 @@ def get_transfer_stats() -> dict:
         if r["first_at"] and (hyper_first_at is None or r["first_at"] < hyper_first_at):
             hyper_first_at = r["first_at"]
 
-    if not row:
-        return {
-            "last_hour": 0, "since_midnight": 0, "last_24h": 0, "all_time": 0,
-            "first_at": None, "userbots": userbots_stats,
-        }
-    # Both timestamp columns are UTC strings in the same format, so the earlier
-    # of the two is simply the smaller string.
-    first_candidates = [t for t in (row["first_at"], hyper_first_at) if t]
+    first_candidates = [t for t in (copied_first_at, hyper_first_at) if t]
     return {
-        "last_hour":      (row["last_hour"] or 0) + hyper_totals["last_hour"],
-        "since_midnight": (row["since_midnight"] or 0) + hyper_totals["since_midnight"],
-        "last_24h":       (row["last_24h"] or 0) + hyper_totals["last_24h"],
-        "all_time":       (row["all_time"] or 0) + hyper_totals["all_time"],
+        "last_hour":      copied_totals["last_hour"] + hyper_totals["last_hour"],
+        "since_midnight": copied_totals["since_midnight"] + hyper_totals["since_midnight"],
+        "last_24h":       copied_totals["last_24h"] + hyper_totals["last_24h"],
+        "all_time":       copied_totals["all_time"] + hyper_totals["all_time"],
         "first_at":       min(first_candidates) if first_candidates else None,
         "userbots":       userbots_stats,
     }

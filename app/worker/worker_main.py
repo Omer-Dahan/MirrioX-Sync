@@ -933,24 +933,27 @@ async def send_forwards_restricted_notification(source_id: int) -> None:
     if src is None:
         return
 
-    if toggle_is_on(state_repo.get_settings_dict(), "allow_download_upload"):
-        fallback_line = (
-            "⬇️ מסלול החירום (הורדה והעלאה) פעיל — הודעה שלא תעבור בדרך המהירה "
-            "תועתק לאט, בהורדה מלאה."
+    settings = state_repo.get_settings_dict()
+    if toggle_is_on(settings, "allow_download_upload"):
+        conns = state_repo.get_int_setting("parallel_connections", 8)
+        status_line = (
+            f"✅ ההעתקה תמשיך — כל קובץ מועבר במלואו, על פני {conns} חיבורים "
+            f"במקביל כדי לקצר את הזמן.\n"
+            f"⏱ צפה לקצב איטי יותר מערוץ רגיל, במיוחד בקבצים גדולים."
         )
     else:
-        fallback_line = (
-            "⬇️ מסלול החירום (הורדה והעלאה) כבוי — הודעה שלא תעבור בדרך המהירה "
-            "תסומן ככישלון במקום להאט את המשימה לשעות. ניתן להפעיל אותו בהגדרות."
+        status_line = (
+            "⛔ ההעתקה מערוץ זה כבויה: המתג <b>העתק ערוצים מוגנים</b> בהגדרות "
+            "אינו פעיל, ולכן ההודעות ייסמנו ככישלון."
         )
 
     text = (
         f"🔒 <b>ערוץ מוגן — חוסם העברה</b>\n\n"
         f"📡 מקור: <b>{esc(src.display())}</b>\n\n"
-        f"הערוץ מסומן ב-Telegram כתוכן מוגן, כך שהעברה רגילה ממנו נחסמת.\n"
-        f"⚡ ההעתקה תמשיך בדרך המהירה (שליחה לפי הפניית הקובץ) — ללא הורדה "
-        f"והעלאה, ולכן ללא האטה משמעותית.\n"
-        f"{fallback_line}"
+        f"הערוץ מסומן ב-Telegram כתוכן מוגן. טלגרם חוסמת ממנו גם העברה רגילה "
+        f"וגם שליחה לפי הפניית הקובץ, ולכן <b>אין דרך להעתיק ממנו בלי להעביר "
+        f"את הקובץ עצמו</b>.\n"
+        f"{status_line}"
     )
 
     await _notify(state_repo.get_setting("main_chat_id"), text, source_id, "forwards_restricted")
@@ -977,12 +980,11 @@ async def send_copy_blocked_notification(job_id: int, source_id: int, error: str
         f"⛔ <b>ההעתקה נחסמה</b>\n\n"
         f"📋 משימה: <b>{job_name}</b>\n"
         f"📡 מקור: {src_name}\n\n"
-        f"הערוץ חוסם העברה, וגם השליחה המהירה (לפי הפניית הקובץ) נדחתה:\n"
+        f"הערוץ חוסם העברה, וגם שליחה לפי הפניית הקובץ נדחתה:\n"
         f"<code>{esc(error)}</code>\n\n"
         f"ההודעות נרשמות ככישלון והמשימה ממשיכה הלאה — היא לא נתקעת.\n"
         f"כדי להעתיק אותן בכל זאת: הפעל בהגדרות את "
-        f"<b>אפשר הורדה והעלאה כמסלול חירום</b> והרץ את המשימה מחדש. "
-        f"<i>שים לב שזה איטי משמעותית.</i>"
+        f"<b>העתק ערוצים מוגנים</b> והרץ את המשימה מחדש."
     )
 
     await _notify(state_repo.get_setting("main_chat_id"), text, job_id, "copy_blocked")

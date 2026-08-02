@@ -416,6 +416,10 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_copied_userbot "
         "ON copied_messages(userbot_id, status, processed_at)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_copied_status_ub_proc "
+        "ON copied_messages(status, userbot_id, processed_at)"
+    )
     _add_column_if_missing(conn, "sources",       "validation_error",   "TEXT")
     _add_column_if_missing(conn, "destinations",  "validation_error",   "TEXT")
     _add_column_if_missing(conn, "jobs",          "content_types",      "TEXT DEFAULT 'file,image,text,video'")
@@ -458,6 +462,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         # NULL = not established yet, 0 = open, 1 = protected. Filled in when the
         # channel is resolved, and corrected the moment a copy is actually refused.
         _add_column_if_missing(conn, table, "forwards_restricted", "INTEGER")
+    _migrate_allow_download_upload(conn)
     # duplicate_scans: rebuild table if old source_id NOT NULL constraint exists
     _migrate_duplicate_scans(conn)
     # delete_scan_jobs: rebuild table if old source_id NOT NULL column exists
@@ -487,12 +492,22 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         # FloodWait-prone calls the worker makes, and they used to run back to
         # back on every account at once.
         "channel_check_delay_ms": "3000",
-        # A protected source is copied by file reference, which moves no bytes.
-        # Download+re-upload is the emergency route and stays off unless asked
-        # for: a job that falls into it silently crawls for hours.
-        "allow_download_upload": "0",
-        # Ceiling for that emergency route, in MB.
+        # On, because there is no alternative: Telegram ties a file_reference to
+        # the chat it came from and refuses it anywhere else, so a protected
+        # source can only be copied by transferring the bytes. Turning this off
+        # means protected channels are not copied at all — which is a legitimate
+        # choice, just not the default one.
+        "allow_download_upload": "1",
+        # Ceiling for a single transferred file, in MB.
         "max_download_mb":    "2048",
+        # Connections per transfer. Telethon uses one, and pays a full round trip
+        # per part; several at once removes that serialisation. What it cannot
+        # remove is Telegram's own limit — a non-premium account is metered by
+        # throughput, and says so with `A wait of N seconds is required in
+        # non-premium accounts` no matter how the bytes are split. Past the point
+        # that saturates the account there is nothing more to win, so this is
+        # deliberately modest. 1 disables the fast path.
+        "parallel_connections": "8",
         # Kill switch for the ad-hoc code execution feature. On by default; can be
         # turned off to disable running/enqueuing snippets entirely.
         "adhoc_enabled":      "1",
@@ -778,6 +793,36 @@ def _migrate_content_types_add_file(conn: sqlite3.Connection) -> None:
     logger.info(
         "Migration: added 'file' content type to %d existing job(s)", cur.rowcount
     )
+
+
+def _migrate_allow_download_upload(conn: sqlite3.Connection) -> None:
+    """
+    Turn `allow_download_upload` on once, for installs that were seeded with it off.
+
+    It was introduced off on the understanding that a protected channel could be
+    copied by file reference at no cost. It cannot: Telegram ties a
+    file_reference to the chat it came from and answers CHAT_FORWARDS_RESTRICTED
+    anywhere else, for `messages.sendMedia` exactly as for a forward. Off
+    therefore does not mean "copy protected channels the cheap way", it means
+    "do not copy protected channels at all" — which nobody chose, because the
+    choice was never presented in those terms.
+
+    Guarded by user_version so it runs exactly once and never overrides the
+    setting again: turning it off afterwards is a legitimate decision and must
+    stick.
+    """
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 2:
+        return
+    cur = conn.execute(
+        "UPDATE app_settings SET value = '1' "
+        "WHERE key = 'allow_download_upload' AND value = '0'"
+    )
+    conn.execute("PRAGMA user_version = 2")
+    if cur.rowcount:
+        logger.info(
+            "Migration: enabled allow_download_upload — a protected channel cannot "
+            "be copied any other way (see _migrate_allow_download_upload)"
+        )
 
 
 def _add_column_if_missing(

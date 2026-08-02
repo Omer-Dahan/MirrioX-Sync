@@ -33,10 +33,47 @@ _admin_chat_id: int | None = None  # chat to send notifications to
 
 # ── Notification helper ────────────────────────────────────────────────────────
 
+# In combined mode the worker starts copying a second or two before the bot
+# finishes connecting, so the first alerts of a run were written to the log and
+# thrown away — which is how the two most important messages of a failing job
+# went missing. Waiting is only right when a bot is actually on its way up:
+# under `main.py worker` there is no bot in this process and never will be, and
+# waiting there would stall the worker for the timeout on every single alert.
+_BOT_READY_WAIT_S = 30
+_bot_starting = False
+_bot_ready: asyncio.Event | None = None
+
+
+def _ready_event() -> asyncio.Event:
+    """The "bot is connected" flag, created lazily so it binds to the running loop."""
+    global _bot_ready
+    if _bot_ready is None:
+        _bot_ready = asyncio.Event()
+        if _bot is not None:
+            _bot_ready.set()
+    return _bot_ready
+
+
+async def _wait_until_ready() -> bool:
+    """Give a still-connecting bot a moment. False if there is not one coming."""
+    if _bot is not None:
+        return True
+    if not _bot_starting:
+        return False
+    try:
+        await asyncio.wait_for(_ready_event().wait(), timeout=_BOT_READY_WAIT_S)
+    except asyncio.TimeoutError:
+        return False
+    return _bot is not None
+
+
 async def send_notification(chat_id: int, text: str) -> None:
     """Send a message via the management bot (MTProto)."""
-    if _bot is None:
-        logger.warning("send_notification called before bot is ready")
+    if not await _wait_until_ready():
+        logger.error(
+            "send_notification: no management bot in this process — alert dropped: %s",
+            text[:120].replace("\n", " "),
+        )
         return
     try:
         await _bot.send_message(chat_id, text, parse_mode="html")
@@ -159,7 +196,11 @@ async def _auto_refresh_loop(bot: TelegramClient) -> None:
 
 async def run_async(config: Config) -> None:
     """Build and run the Telethon bot inside an existing event loop."""
-    global _bot
+    global _bot, _bot_starting
+
+    # Claimed before the connect: a worker alert raised during those few seconds
+    # should wait for us rather than be dropped.
+    _bot_starting = True
 
     bot = TelegramClient(
         StringSession(),          # ephemeral session — bot token auth needs no file
@@ -303,6 +344,14 @@ async def run_async(config: Config) -> None:
                 await answer_callback(event)
                 logger.warning("Unhandled callback data: %s", data)
 
+            # A dispatched handler may have found the adopted message dead and
+            # forgotten it (see update_main_message/forget_main_message). The
+            # previously tracked panel may still be alive, so put it back
+            # instead of leaving the bot with no panel at all. This covers
+            # every branch above, not just the two that check `ok` inline.
+            if adopted and not state_repo.get_setting("main_message_id"):
+                _restore_panel(prev_chat_id, prev_msg_id)
+
         except Exception as e:
             logger.exception("Error handling callback %s: %s", data, e)
             try:
@@ -392,6 +441,8 @@ async def run_async(config: Config) -> None:
     logger.info("Connecting management bot via MTProto (bot token)...")
     await bot.start(bot_token=config.BOT_TOKEN)
     _bot = bot
+    # Releases any worker notification that arrived while we were connecting.
+    _ready_event().set()
     me = await bot.get_me()
     logger.info("✅ Management bot connected: @%s", me.username)
 

@@ -114,6 +114,7 @@ async def handle_setting_value(bot: TelegramClient, event, uid: int) -> None:
         "dest_min_delay_ms":    (0,    60000),
         "channel_check_delay_ms": (0,  60000),
         "max_download_mb":      (1,    4096),
+        "parallel_connections": (1,    20),
         "max_retries":          (1,    20),
         "heartbeat_interval_s": (5,    300),
     }
